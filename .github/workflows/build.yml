@@ -1,0 +1,105 @@
+name: Spot-Katalog bauen
+
+# Laeuft von allein, jeden Tag frueh. Jeder Lauf holt ~420 Zellen neu aus
+# OSM (nie gesehene und Europa zuerst, dann die aeltesten) und traegt
+# fehlende Standpunkthoehen nach. Nach ~5 Tagen ist die Welt einmal durch.
+#
+# Budgets, damit niemand die App sperrt:
+# - Overpass: ~420 Abfragen, ~300 MB am Tag (erbeten: <10 000 und <1 GB).
+#   Bei "429 zu viel" hoert der Lauf mit OSM sofort auf.
+# - Mapterhorn: 2000 Kacheln je Band, nur fuer Spots am Hang.
+#   Bei 403/429/503 ist fuer den Tag Schluss.
+# Von Hand: "Actions -> Spot-Katalog bauen -> Run workflow".
+on:
+  push:
+    branches: [main]
+    paths:
+      - build_catalog.py
+      - .github/workflows/build.yml
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spot-catalog
+  cancel-in-progress: false
+
+jobs:
+  band:
+    name: Band ${{ matrix.band }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      # Zwei gleichzeitig: Overpass erlaubt zwei Abfragen parallel, mehr
+      # waere unhoeflich gegenueber den Betreibern.
+      max-parallel: 2
+      matrix:
+        band: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow==10.4.0
+      - name: Letzten Katalog holen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern "*" --dir previous \
+            || echo "Noch kein Katalog veroeffentlicht"
+      - name: Band bauen
+        run: |
+          python build_catalog.py --band ${{ matrix.band }} --bands 6 \
+            --previous previous --out out --crawl-cells 70 --height-budget 2000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: band-${{ matrix.band }}
+          path: out/
+          retention-days: 3
+
+  release:
+    name: Veroeffentlichen
+    needs: band
+    # Auch wenn ein Band ausfaellt: dessen Zellen kommen aus der Vorwoche.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          path: bands
+          pattern: band-*
+          merge-multiple: true
+      - name: Letzten Katalog holen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern "*" --dir previous \
+            || echo "Noch kein Katalog veroeffentlicht"
+      - name: Zusammensetzen
+        run: python build_catalog.py --assemble bands --previous previous --out release
+      - name: Als Release veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="catalog-$(date -u +%Y%m%d-%H%M)"
+          gh release create "$TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Spot-Katalog $(date -u +%Y-%m-%d)" \
+            --notes "Daten © OpenStreetMap-Mitwirkende, ODbL. Standpunkthoehen: Mapterhorn (https://mapterhorn.com/attribution)." \
+            --latest
+          # Nur die zwei neuesten Kataloge behalten.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].tagName' \
+            | while read -r old; do
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
