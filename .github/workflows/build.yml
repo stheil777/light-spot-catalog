@@ -1,8 +1,10 @@
 name: Spot-Katalog bauen
 
-# Laeuft von allein, jeden Tag frueh. Jeder Lauf holt ~420 Zellen neu aus
-# OSM (nie gesehene und Europa zuerst, dann die aeltesten) und traegt
-# fehlende Standpunkthoehen nach. Nach ~5 Tagen ist die Welt einmal durch.
+# Laeuft von allein, jeden Tag frueh. Jeder Lauf holt bis zu ~420 Zellen neu
+# aus OSM (nur Zellen mit Land, siehe land_cells.json; nie gesehene zuerst,
+# vom Rheintal und Madeira nach aussen, dann die aeltesten) und traegt
+# fehlende Standpunkthoehen nach. Nach ~3 Tagen ist die Welt einmal durch.
+# Jedes Band hoert nach 290 Minuten auf und speichert, was es hat.
 #
 # Budgets, damit niemand die App sperrt:
 # - Overpass: ~420 Abfragen, ~300 MB am Tag (erbeten: <10 000 und <1 GB).
@@ -55,7 +57,8 @@ jobs:
       - name: Band bauen
         run: |
           python build_catalog.py --band ${{ matrix.band }} --bands 6 \
-            --previous previous --out out --crawl-cells 70 --height-budget 2000
+            --previous previous --out out --crawl-cells 70 --height-budget 2000 \
+            --time-budget 290
       - uses: actions/upload-artifact@v4
         with:
           name: band-${{ matrix.band }}

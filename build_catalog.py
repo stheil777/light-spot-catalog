@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LIGHT Spot-Katalog.
 
-Baut einmal pro Woche aus OpenStreetMap einen weltweiten Katalog fotogener
+Baut jeden Tag ein Stueck aus OpenStreetMap einen weltweiten Katalog fotogener
 Orte (Aussichtspunkte, Gipfel, Felsen, Burgen, Leuchttuerme, Straende) und
 legt ihn als 5-Grad-Kacheln ab. Die App laedt nur die Kacheln um den
 Suchort, statt bei jeder Suche die ehrenamtlichen Overpass-Server zu fragen.
@@ -46,7 +46,22 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.private.coffee/api/interpreter",
 ]
 OVERPASS_PAUSE_SECONDS = 1.5
-MAX_SUBDIVISION_DEPTH = 3
+# Ist ein Server ausgelastet (504), wird einmal gewartet und neu gefragt,
+# statt die Zelle sofort aufzugeben.
+OVERPASS_RETRY_PAUSE_SECONDS = 60
+MAX_SUBDIVISION_DEPTH = 2
+# "Zu viel" (429): eine Minute warten. Nach so vielen Absagen im ganzen Lauf
+# ist fuer heute Schluss.
+THROTTLE_PAUSE_SECONDS = 60
+MAX_THROTTLE_STRIKES = 20
+throttle_strikes = 0
+
+# Abgefragt wird je Teilzelle von 1,25 Grad, nicht die ganze 5-Grad-Zelle:
+# die ganze Zelle lief am 25.09.2026 fast immer in einen Timeout, bevor
+# zerlegt wurde, und das kostete je Zelle zwei Server mal vier Minuten.
+SUB_PER_SIDE = 4
+# Welche Teilzellen Land haben (make_land_mask.py). Meer wird nie gefragt.
+LAND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "land_cells.json")
 
 MAPTERHORN_URL = "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp"
 MAPTERHORN_ZOOMS = (13, 12)
@@ -63,8 +78,12 @@ TERRARIUM_ZOOM = 12
 TERRARIUM_TILE = 256
 FLAT_RELIEF_METERS = 20.0
 
-# Europa und Madeira zuerst: dort wird die App zuerst benutzt.
-PRIORITY_BOX = (25, -30, 72, 45)  # sued, west, nord, ost
+# Von innen nach aussen: zuerst das Rheintal und Madeira, wo die App benutzt
+# wird, dann in Ringen nach Entfernung vom Rheintal. Vorher lief ein
+# Kasten ab 30 Grad West von links nach rechts, und der Atlantik kam vor
+# Deutschland dran.
+HOME = (50.17, 7.70)
+FIRST = [(50.17, 7.70), (32.75, -16.95)]  # Rheintal, Madeira
 
 KEEP_TAGS = {
     "tourism", "man_made", "natural", "tower:type", "historic",
@@ -91,25 +110,58 @@ def cell_bbox(row, col):
     return south, west, south + CELL_DEGREES, west + CELL_DEGREES
 
 
-def in_priority_box(row, col):
-    south, west, north, east = cell_bbox(row, col)
-    p_south, p_west, p_north, p_east = PRIORITY_BOX
-    return north > p_south and south < p_north and east > p_west and west < p_east
+def cell_of(lat, lon):
+    return int((lat - LAT_MIN) // CELL_DEGREES), int((lon + 180) // CELL_DEGREES)
+
+
+def land_cells():
+    with open(LAND_FILE) as handle:
+        return json.load(handle)["cells"]
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a))
+
+
+def global_order():
+    """Alle Landzellen, die wichtigsten zuerst."""
+    first = [cell_of(lat, lon) for lat, lon in FIRST]
+    cells = []
+    for name in land_cells():
+        row, col = int(name[1:3]), int(name[4:6])
+        south, west, north, east = cell_bbox(row, col)
+        centre = distance_km(HOME[0], HOME[1], (south + north) / 2, (west + east) / 2)
+        rank = first.index((row, col)) if (row, col) in first else len(first)
+        cells.append(((rank, centre), (row, col)))
+    return [cell for _, cell in sorted(cells)]
 
 
 def band_cells(band, bands):
-    # Zeilen verschraenkt verteilen, damit kein Band nur Europa bekommt;
-    # innerhalb des Bandes kommt Europa zuerst an die Hoehen.
-    cells = [(row, col) for row in range(ROWS) if row % bands == band for col in range(COLS)]
-    cells.sort(key=lambda cell: (not in_priority_box(*cell), cell))
-    return cells
+    # Reihum aus der Gesamtreihenfolge: jedes Band faengt nahe am Rheintal an.
+    return [cell for index, cell in enumerate(global_order()) if index % bands == band]
+
+
+def sub_bboxes(row, col, subs):
+    south, west, _, _ = cell_bbox(row, col)
+    step = CELL_DEGREES / SUB_PER_SIDE
+    for sub in subs:
+        i, j = divmod(sub, SUB_PER_SIDE)
+        s, w = south + i * step, west + j * step
+        yield s, w, s + step, w + step
 
 
 # ---------------------------------------------------------------- Overpass
 
 def overpass_query(south, west, north, east):
     bbox = f"{south},{west},{north},{east}"
-    return f"""[out:json][timeout:180][maxsize:1073741824];
+    # Ohne eigenes maxsize: wer 1 GB Speicher reserviert, bekommt vom Server
+    # bei Last sofort 504. Am 26.09.2026 nachgemessen, dieselbe Abfrage am
+    # Rheintal: mit 1 GB 504 nach 11 s, ohne 200 nach 2 s. Daran scheiterte
+    # der ganze erste Lauf, nicht an ueberlasteten Servern.
+    return f"""[out:json][timeout:90];
 (
   nwr["tourism"="viewpoint"]({bbox});
   nwr["man_made"="lighthouse"]({bbox});
@@ -132,8 +184,10 @@ class OverpassThrottled(Exception):
 def fetch_overpass(south, west, north, east):
     body = urllib.parse.urlencode({"data": overpass_query(south, west, north, east)}).encode()
     last_error = None
-    # Ein Versuch je Server. Wiederholen ist Sache des naechsten Tages.
-    for endpoint in OVERPASS_ENDPOINTS:
+    # Zwei Runden ueber beide Server, dazwischen eine Minute Pause.
+    for attempt, endpoint in enumerate(OVERPASS_ENDPOINTS * 2):
+        if attempt == len(OVERPASS_ENDPOINTS):
+            time.sleep(OVERPASS_RETRY_PAUSE_SECONDS)
         request = urllib.request.Request(
             endpoint,
             data=body,
@@ -141,7 +195,7 @@ def fetch_overpass(south, west, north, east):
                      "Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=240) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 payload = json.loads(response.read())
             remark = payload.get("remark") or ""
             if "error" in remark.lower():
@@ -150,7 +204,16 @@ def fetch_overpass(south, west, north, east):
             return payload.get("elements", [])
         except urllib.error.HTTPError as error:
             if error.code == 429:
-                raise OverpassThrottled(endpoint)
+                # Die Abfrage-Plaetze fuer diese Adresse sind belegt. Warten
+                # und neu fragen; erst nach mehreren Absagen fuer heute Schluss.
+                global throttle_strikes
+                throttle_strikes += 1
+                if throttle_strikes > MAX_THROTTLE_STRIKES:
+                    raise OverpassThrottled(endpoint)
+                log(f"    overpass {endpoint.split('/')[2]}: 429, warte {THROTTLE_PAUSE_SECONDS} s")
+                time.sleep(THROTTLE_PAUSE_SECONDS)
+                last_error = error
+                continue
             last_error = error
             log(f"    overpass {endpoint.split('/')[2]} {south},{west}: HTTP {error.code}")
             time.sleep(15)
@@ -409,7 +472,7 @@ def previous_manifest(previous_dir):
 
 
 def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
-               fixture=None, coarse_budget=40000):
+               fixture=None, coarse_budget=40000, time_budget_minutes=290):
     """Ein Band: die aeltesten Zellen neu aus OSM, ueberall fehlende Hoehen.
 
     Overpass bittet um hoechstens 10 000 Abfragen und rund 1 GB am Tag. Die
@@ -430,23 +493,32 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
     totals = {"crawled": 0, "kept": 0, "spots": 0, "heights_new": 0, "heights_flat": 0,
               "heights_reused": 0, "heights_missing": 0, "failed": 0}
 
+    land = land_cells()
     order = band_cells(band, bands)
-    # Nie gesehen zuerst (Europa vorn, band_cells sortiert schon so), dann
+    rank = {cell: index for index, cell in enumerate(order)}
+    # Nie gesehen zuerst (Rheintal vorn, band_cells sortiert schon so), dann
     # nach Alter des letzten Standes.
     order.sort(key=lambda cell: (
         cell_name(*cell) in old["crawled"],
         old["crawled"].get(cell_name(*cell), ""),
-        not in_priority_box(*cell),
+        rank[cell],
     ))
     to_crawl = set(order[:crawl_cells])
     throttled = False
+    # Rechtzeitig aufhoeren und speichern. Am 25.09.2026 wurde Band 0 an der
+    # Zeitgrenze des Laufs abgebrochen, und alles Gefundene war verloren.
+    deadline = started + time_budget_minutes * 60
+    out_of_time = False
 
     # Crawl-Zellen zuerst, damit ein Abbruch wegen "zu viel" nur sie trifft.
     for row, col in sorted(order, key=lambda cell: (cell not in to_crawl, order.index(cell))):
         name = cell_name(row, col)
         south, west, north, east = cell_bbox(row, col)
         previous = previous_spots(previous_dir, name)
-        crawl = (row, col) in to_crawl and not throttled
+        if not out_of_time and time.time() > deadline:
+            out_of_time = True
+            log(f"  Zeitbudget ({time_budget_minutes} min) erreicht: Rest behaelt den alten Stand")
+        crawl = (row, col) in to_crawl and not throttled and not out_of_time
 
         elements = None
         if crawl:
@@ -456,7 +528,13 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
                                 if south <= (e.get("lat") or e.get("center", {}).get("lat", 999)) < north
                                 and west <= (e.get("lon") or e.get("center", {}).get("lon", 999)) < east]
                 else:
-                    elements = elements_in(south, west, north, east)
+                    # Erst zuweisen, wenn alle Teile da sind. Am 26.09.2026
+                    # kam mitten in der Zelle "zu viel", und die halbe Zelle
+                    # wurde als ganze gespeichert: ohne Loreley.
+                    collected = []
+                    for sub in sub_bboxes(row, col, land[name]):
+                        collected.extend(elements_in(*sub))
+                    elements = collected
             except OverpassThrottled as error:
                 throttled = True
                 log(f"  {name}: Overpass sagt 'zu viel' ({error}), OSM-Abruf fuer heute beendet")
@@ -474,7 +552,7 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
                     crawled_out[name] = old["crawled"].get(name, "")
                 continue
             for spot in previous.get("spots", []):
-                if needs_height(spot["g"]) and "h" not in spot:
+                if needs_height(spot["g"]) and "h" not in spot and not out_of_time:
                     resolve_height(spot, terrain, coarse, totals)
                     if "h" not in spot:
                         totals["heights_missing"] += 1
@@ -492,7 +570,7 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
             if spot is None or spot_key(spot) in seen:
                 continue
             seen.add(spot_key(spot))
-            if needs_height(spot["g"]):
+            if needs_height(spot["g"]) and time.time() <= deadline:
                 former = reuse.get(spot_key(spot))
                 if former and former["a"] == spot["a"] and former["o"] == spot["o"] and "h" in former:
                     spot["h"] = former["h"]
@@ -547,6 +625,15 @@ def assemble(bands_dir, previous_dir, out_dir):
                     with open(source, "rb") as src, open(os.path.join(bands_dir, f"{name}.bin"), "wb") as dst:
                         dst.write(src.read())
 
+    # Meer: bekannt und leer. Sonst hielte die App eine Suche an der Kueste
+    # fuer "Katalog weiss es nicht" und fragte wieder selbst Overpass.
+    land = land_cells()
+    for row in range(ROWS):
+        for col in range(COLS):
+            name = cell_name(row, col)
+            if name not in land:
+                cells.setdefault(name, 0)
+
     assets = [name for name, count in cells.items() if count > 0]
     if len(assets) + 1 > MAX_RELEASE_ASSETS:
         sys.exit(f"{len(assets)} Kacheln: mehr als ein Release tragen kann")
@@ -585,6 +672,8 @@ def main():
     parser.add_argument("--fixture", help="Overpass-JSON statt Netz (Test)")
     parser.add_argument("--crawl-cells", type=int, default=70,
                         help="Zellen je Band und Lauf neu aus OSM; schont Overpass")
+    parser.add_argument("--time-budget", type=int, default=290,
+                        help="Minuten; danach nur noch speichern")
     args = parser.parse_args()
 
     if args.assemble:
@@ -595,7 +684,7 @@ def main():
             with open(args.fixture) as handle:
                 fixture = json.load(handle)["elements"]
         build_band(args.band, args.bands, args.previous, args.out, args.height_budget,
-                   args.crawl_cells, fixture)
+                   args.crawl_cells, fixture, time_budget_minutes=args.time_budget)
 
 
 if __name__ == "__main__":

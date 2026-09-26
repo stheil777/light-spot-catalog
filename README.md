@@ -3,9 +3,11 @@
 Weltweiter Katalog fotogener Orte für die App LIGHT: Aussichtspunkte,
 Aussichtstürme, Gipfel, Felsen, Burgen, Leuchttürme und Strände.
 
-Eine GitHub Action läuft jeden Tag. Sie holt je Lauf rund 420 Zellen neu
-aus OpenStreetMap (nie gesehene und Europa zuerst, dann die ältesten) und
-trägt fehlende Standpunkthöhen nach. Die Budgets bleiben deutlich unter den
+Eine GitHub Action läuft jeden Tag. Sie holt je Lauf bis zu 420 Zellen neu
+aus OpenStreetMap, nur dort, wo Land ist (`land_cells.json`, erzeugt mit
+`make_land_mask.py`). Reihenfolge: nie gesehene zuerst, vom Rheintal und
+Madeira nach außen, dann die ältesten. Sie
+trägt fehlende Standpunkthöhen nach. Jedes Band hört nach 290 Minuten auf und speichert. Die Budgets bleiben deutlich unter den
 Bitten der Betreiber; meldet ein Server „zu viel“, hört der Lauf für den Tag
 auf. Jeder Lauf wird als Release veröffentlicht. Die App lädt nur die 5°-Kacheln rund um den Suchort:
 
