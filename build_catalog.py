@@ -660,13 +660,46 @@ def assemble(bands_dir, previous_dir, out_dir):
         f"{sum(cells.values())} Spots gesamt")
 
 
+def status(release_dir, failed_bands=""):
+    """Kurzer Stand fuer das Issue 'Katalog-Status', in Markdown."""
+    with open(os.path.join(release_dir, "manifest.json")) as handle:
+        manifest = json.load(handle)
+    land = land_cells()
+    cells = manifest["cells"]
+    done = sum(1 for name in land if name in cells)
+    with_spots = sum(1 for count in cells.values() if count > 0)
+    total = sum(cells.values())
+
+    home = cell_name(*cell_of(*HOME))
+    loreley = False
+    path = os.path.join(release_dir, f"{home}.bin")
+    if os.path.exists(path):
+        with open(path, "rb") as handle:
+            spots = json.loads(zlib.decompress(handle.read(), -15))["spots"]
+        loreley = any("lorele" in spot["g"].get("name", "").lower() for spot in spots)
+
+    lines = [
+        f"**{manifest['built'][:10]}** · {done} von {len(land)} Landzellen "
+        f"({round(100 * done / len(land))} %) · {with_spots} Kacheln mit Spots · {total} Spots",
+        f"- Rheintal ({home}): "
+        + (f"{cells[home]} Spots · Loreley: {'ja' if loreley else 'nein'}" if home in cells else "noch nicht drin"),
+    ]
+    if failed_bands:
+        lines.append(f"- Ausgefallen: {failed_bands} (deren Zellen behalten den alten Stand)")
+    if done == len(land):
+        lines.append("- Die Welt ist einmal komplett drin. Ab jetzt wird nur noch aufgefrischt.")
+    print("\n".join(lines))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--band", type=int)
     parser.add_argument("--bands", type=int, default=6)
     parser.add_argument("--previous")
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--out")
     parser.add_argument("--assemble")
+    parser.add_argument("--status", help="Release-Ordner: Stand als Markdown ausgeben")
+    parser.add_argument("--failed-bands", default="")
     parser.add_argument("--height-budget", type=int, default=2000,
                         help="Hoehenkacheln pro Lauf; schont Mapterhorn")
     parser.add_argument("--fixture", help="Overpass-JSON statt Netz (Test)")
@@ -676,7 +709,9 @@ def main():
                         help="Minuten; danach nur noch speichern")
     args = parser.parse_args()
 
-    if args.assemble:
+    if args.status:
+        status(args.status, args.failed_bands)
+    elif args.assemble:
         assemble(args.assemble, args.previous, args.out)
     else:
         fixture = None

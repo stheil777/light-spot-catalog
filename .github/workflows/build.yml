@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: spot-catalog
@@ -42,8 +43,8 @@ jobs:
       matrix:
         band: [0, 1, 2, 3, 4, 5]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install pillow==10.4.0
@@ -59,7 +60,7 @@ jobs:
           python build_catalog.py --band ${{ matrix.band }} --bands 6 \
             --previous previous --out out --crawl-cells 70 --height-budget 2000 \
             --time-budget 290
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: band-${{ matrix.band }}
           path: out/
@@ -72,11 +73,11 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: bands
           pattern: band-*
@@ -106,3 +107,13 @@ jobs:
             | while read -r old; do
                 gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
               done
+      - name: Stand ins Issue 'Katalog-Status' schreiben
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FAILED=$(gh run view ${{ github.run_id }} --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '[.jobs[] | select(.name | startswith("Band")) | select(.conclusion != "success") | .name] | join(", ")')
+          python build_catalog.py --status release --failed-bands "$FAILED" > status.md
+          cat status.md
+          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file status.md
