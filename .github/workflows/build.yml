@@ -22,9 +22,11 @@ on:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
+# Grundsaetzlich nur lesen. Schreiben darf allein der Schritt, der
+# veroeffentlicht: laeuft in einem Band fremder Code (z. B. ueber ein
+# kompromittiertes Paket), kann er so kein Release austauschen.
 permissions:
-  contents: write
-  issues: write
+  contents: read
 
 concurrency:
   group: spot-catalog
@@ -72,6 +74,9 @@ jobs:
     # Auch wenn ein Band ausfaellt: dessen Zellen kommen aus der Vorwoche.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
