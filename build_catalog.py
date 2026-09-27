@@ -614,11 +614,21 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
             write_cell_file(os.path.join(out_dir, f"{name}.bin"),
                             {"v": FORMAT_VERSION, "cell": name, "spots": spots})
             log(f"  {name}: {len(spots)} Spots (neu aus OSM)")
+        # Nach jeder neuen Zelle sichern: wird das Band doch abgebrochen,
+        # laedt der Workflow den Zwischenstand trotzdem hoch, und was fehlt,
+        # kommt beim Zusammenbauen aus der Vorwoche.
+        save_band_manifest(out_dir, band, cells_out, crawled_out)
 
-    with open(os.path.join(out_dir, f"manifest-band{band}.json"), "w") as handle:
-        json.dump({"cells": cells_out, "crawled": crawled_out}, handle)
+    save_band_manifest(out_dir, band, cells_out, crawled_out)
     log(f"Band {band}: {totals} · Mapterhorn {terrain.downloads} Kacheln · "
         f"AWS {coarse.downloads} Kacheln · {int(time.time() - started)} s")
+
+
+def save_band_manifest(out_dir, band, cells, crawled):
+    path = os.path.join(out_dir, f"manifest-band{band}.json")
+    with open(path + ".tmp", "w") as handle:
+        json.dump({"cells": cells, "crawled": crawled}, handle)
+    os.replace(path + ".tmp", path)
 
 
 def assemble(bands_dir, previous_dir, out_dir):

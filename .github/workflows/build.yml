@@ -58,11 +58,15 @@ jobs:
           gh release download --repo "$GITHUB_REPOSITORY" --pattern "*" --dir previous \
             || echo "Noch kein Katalog veroeffentlicht"
       - name: Band bauen
+        # Unter der Job-Grenze (340), damit danach noch hochgeladen wird.
+        timeout-minutes: 320
         run: |
           python build_catalog.py --band ${{ matrix.band }} --bands 6 \
             --previous previous --out out --crawl-cells 70 --height-budget 2000 \
             --time-budget 290
+      # Auch nach Abbruch oder Fehler: jede fertige Zelle zaehlt.
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: band-${{ matrix.band }}
           path: out/
