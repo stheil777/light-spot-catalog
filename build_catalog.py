@@ -181,11 +181,28 @@ class OverpassThrottled(Exception):
     """Der Server sagt "zu viel". Dann fuer heute Schluss, nicht nachbohren."""
 
 
+class OutOfTime(Exception):
+    """Das Zeitbudget ist um, auch mitten in einer Zelle.
+
+    Am 27.09.2026 hing Band 2 ueber zwei Stunden in einer einzigen Zelle
+    (Marokko): Timeout, zerlegen, wieder Timeout. Das Budget wurde nur
+    zwischen den Zellen geprueft, die harte Job-Grenze griff zuerst, und
+    alles, was das Band in fuenf Stunden gebaut hatte, war verloren.
+    Deshalb prueft jetzt jeder einzelne Abruf die Uhr.
+    """
+
+
+# Wird vom Lauf gesetzt; None heisst ohne Grenze (Tests, Fixture).
+overpass_deadline = None
+
+
 def fetch_overpass(south, west, north, east):
     body = urllib.parse.urlencode({"data": overpass_query(south, west, north, east)}).encode()
     last_error = None
     # Zwei Runden ueber beide Server, dazwischen eine Minute Pause.
     for attempt, endpoint in enumerate(OVERPASS_ENDPOINTS * 2):
+        if overpass_deadline is not None and time.time() > overpass_deadline:
+            raise OutOfTime()
         if attempt == len(OVERPASS_ENDPOINTS):
             time.sleep(OVERPASS_RETRY_PAUSE_SECONDS)
         request = urllib.request.Request(
@@ -508,6 +525,8 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
     # Rechtzeitig aufhoeren und speichern. Am 25.09.2026 wurde Band 0 an der
     # Zeitgrenze des Laufs abgebrochen, und alles Gefundene war verloren.
     deadline = started + time_budget_minutes * 60
+    global overpass_deadline
+    overpass_deadline = deadline
     out_of_time = False
 
     # Crawl-Zellen zuerst, damit ein Abbruch wegen "zu viel" nur sie trifft.
@@ -535,6 +554,10 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
                     for sub in sub_bboxes(row, col, land[name]):
                         collected.extend(elements_in(*sub))
                     elements = collected
+            except OutOfTime:
+                out_of_time = True
+                log(f"  {name}: Zeitbudget ({time_budget_minutes} min) mitten in der Zelle erreicht, "
+                    "Rest behaelt den alten Stand")
             except OverpassThrottled as error:
                 throttled = True
                 log(f"  {name}: Overpass sagt 'zu viel' ({error}), OSM-Abruf fuer heute beendet")
