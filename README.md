@@ -3,13 +3,14 @@
 Weltweiter Katalog fotogener Orte für die App LIGHT: Aussichtspunkte,
 Aussichtstürme, Gipfel, Felsen, Burgen, Leuchttürme und Strände.
 
-Eine GitHub Action läuft jeden Tag. Sie holt je Lauf bis zu 420 Zellen neu
-aus OpenStreetMap, nur dort, wo Land ist (`land_cells.json`, erzeugt mit
-`make_land_mask.py`). Reihenfolge: nie gesehene zuerst, vom Rheintal und
-Madeira nach außen, dann die ältesten. Sie
-trägt fehlende Standpunkthöhen nach. Jedes Band hört nach 290 Minuten auf und speichert. Die Budgets bleiben deutlich unter den
-Bitten der Betreiber; meldet ein Server „zu viel“, hört der Lauf für den Tag
-auf. Jeder Lauf wird als Release veröffentlicht. Die App lädt nur die 5°-Kacheln rund um den Suchort:
+Einmal die Woche (`osm.yml`) kommt die ganze Welt aus den
+OSM-Komplettdaten von [Geofabrik](https://download.geofabrik.de/): je Kontinent
+herunterladen, mit osmium auf die Spot-Arten filtern, in 5-Grad-Zellen
+schneiden. Danach kennt der Katalog jede Zelle zwischen 60° Süd und 80° Nord.
+Jeden Tag (`build.yml`) werden fehlende Standpunkthöhen nachgetragen,
+Rheintal zuerst, in festen Budgets. Jeder Lauf wird als Release veröffentlicht,
+der Stand steht danach in Issue #1. Die App lädt nur die 5°-Kacheln rund um
+den Suchort:
 
 ```
 https://github.com/stheil777/light-spot-catalog/releases/latest/download/manifest.json
@@ -28,4 +29,5 @@ liegt, den Standpunkt oben an der Kante (`s`).
 
 ## Von Hand neu bauen
 
-Actions → „Spot-Katalog bauen“ → Run workflow.
+Actions → „Spot-Katalog aus OSM“ (Orte) oder „Spot-Katalog bauen“ (Höhen) → Run workflow.
+Test ohne Netz: `python build_catalog.py --selftest`.

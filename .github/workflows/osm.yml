@@ -1,0 +1,109 @@
+name: Spot-Katalog aus OSM
+
+# Einmal die Woche die ganze Welt aus den OSM-Komplettdaten von Geofabrik:
+# je Kontinent herunterladen, mit osmium auf die Spot-Arten filtern, in
+# 5-Grad-Zellen schneiden. Danach ist jede Zelle der Welt im Katalog.
+# Hoehen kommen aus dem letzten Katalog; fehlende traegt build.yml taeglich nach.
+# Overpass wird dafuer nicht mehr gefragt: die Server schafften am Tag nur
+# rund 40 Zellen (504, Timeouts, 429).
+#
+# Faellt eine Region aus, wird nichts veroeffentlicht (sonst fehlten an ihren
+# Raendern Spots). Dann: "Re-run failed jobs".
+on:
+  schedule:
+    - cron: "17 1 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Dieselbe Gruppe wie build.yml: nie zwei Laeufe gleichzeitig am Release.
+concurrency:
+  group: spot-catalog
+  cancel-in-progress: false
+
+jobs:
+  region:
+    name: OSM ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      # Drei gleichzeitig: Geofabrik wird von Freiwilligen betrieben.
+      max-parallel: 3
+      matrix:
+        region: [europe, asia, north-america, africa, south-america, russia,
+                 australia-oceania, central-america, antarctica]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: osmium installieren
+        run: sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+      - run: pip install pillow==10.4.0 && python build_catalog.py --selftest
+      - name: Platz schaffen
+        # Europa sind ueber 30 GB. Vorinstalliertes, das hier keiner braucht, weg.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          DIR=$(df --output=avail,target / /mnt 2>/dev/null | tail -n +2 | sort -n | tail -1 | awk '{print $2}')
+          sudo mkdir -p "$DIR/osm" && sudo chown "$USER" "$DIR/osm"
+          echo "WORK=$DIR/osm" >> "$GITHUB_ENV"
+          df -h / /mnt || true
+      - name: Herunterladen
+        run: |
+          URL="https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf"
+          UA="LIGHT-SpotCatalog/1.0 (+https://github.com/stheil777/light-spot-catalog)"
+          curl -fsSL --retry 5 --retry-all-errors -A "$UA" -o "$WORK/region.osm.pbf" "$URL"
+          curl -fsSL --retry 5 -A "$UA" "$URL.md5" | awk -v f="$WORK/region.osm.pbf" '{print $1"  "f}' | md5sum -c -
+          ls -la "$WORK/region.osm.pbf"
+      - name: Filtern und schneiden
+        run: |
+          # Grob wie die alte Overpass-Abfrage; genau filtert build_catalog.py.
+          osmium tags-filter "$WORK/region.osm.pbf" \
+            nwr/tourism=viewpoint nwr/man_made=lighthouse \
+            nwr/natural=beach,peak,cliff,rock nwr/tower:type=observation \
+            nwr/historic=castle,ruins \
+            -o "$WORK/spots.osm.pbf"
+          rm "$WORK/region.osm.pbf"
+          osmium export "$WORK/spots.osm.pbf" -f geojsonseq -x print_record_separator=false \
+            --add-unique-id=type_id -o "$WORK/spots.geojsonseq"
+          osmium add-locations-to-ways -n "$WORK/spots.osm.pbf" -f opl -o "$WORK/spots.opl"
+          python build_catalog.py --site-relations "$WORK/spots.opl" "$WORK/spots.geojsonseq"
+          python build_catalog.py --split-osm "$WORK/spots.geojsonseq" --out "osm/${{ matrix.region }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: osm-${{ matrix.region }}
+          path: osm/
+          retention-days: 7
+
+  release:
+    name: Veroeffentlichen
+    needs: region
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          path: osm
+          pattern: osm-*
+          merge-multiple: true
+      - name: Letzten Katalog holen (fuer die Hoehen)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern "*" --dir previous \
+            || echo "Noch kein Katalog veroeffentlicht"
+      - name: Zusammensetzen
+        run: python build_catalog.py --assemble-osm osm --previous previous --out release
+      - name: Veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./publish.sh

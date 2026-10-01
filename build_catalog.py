@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """LIGHT Spot-Katalog.
 
-Baut jeden Tag ein Stueck aus OpenStreetMap einen weltweiten Katalog fotogener
-Orte (Aussichtspunkte, Gipfel, Felsen, Burgen, Leuchttuerme, Straende) und
-legt ihn als 5-Grad-Kacheln ab. Die App laedt nur die Kacheln um den
-Suchort, statt bei jeder Suche die ehrenamtlichen Overpass-Server zu fragen.
+Baut aus den OSM-Komplettdaten (Geofabrik, einmal die Woche) einen weltweiten
+Katalog fotogener Orte (Aussichtspunkte, Gipfel, Felsen, Burgen, Leuchttuerme,
+Straende) und legt ihn als 5-Grad-Kacheln ab. Die App laedt nur die Kacheln um
+den Suchort, statt bei jeder Suche die ehrenamtlichen Overpass-Server zu fragen.
+
+Bis 01.10.2026 kam der Katalog Zelle fuer Zelle aus Overpass. Die Server waren
+so ausgelastet (504, Timeouts, 429), dass am Tag nur rund 40 von 1129
+Landzellen durchkamen. Die Komplettdaten bringen die ganze Welt in einem Lauf.
 
 Fuer Aussichtspunkte, Aussichtstuerme und Gipfel steht die Standpunkthoehe
 gleich mit drin, aus Mapterhorn, und der Standpunkt sitzt auf dem hoechsten
 Punkt im Umkreis von 100 m (die Karte setzt Aussichtspunkte gern an den Hang).
-Das kostet einmal hier statt bei jedem Nutzer.
+Das kostet einmal hier statt bei jedem Nutzer, und taeglich nur ein Budget:
+die taeglichen Laeufe tragen fehlende Hoehen nach.
 
 Aufrufe:
+  build_catalog.py --site-relations spots.opl spots.geojsonseq
+  build_catalog.py --split-osm spots.geojsonseq --out osm/europe
+  build_catalog.py --assemble-osm osm --previous prev --out release
   build_catalog.py --band 0 --bands 6 --previous prev --out out
   build_catalog.py --assemble bands --previous prev --out release
+  build_catalog.py --status release
+  build_catalog.py --selftest
 
 Kachelformat: JSON, roh-deflate-komprimiert (wbits=-15), damit iOS es mit
 NSData.decompressed(using: .zlib) ohne Zusatzbibliothek oeffnet.
@@ -25,10 +35,12 @@ import io
 import json
 import math
 import os
+import re
+import shutil
 import sys
+import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import zlib
 
@@ -38,30 +50,9 @@ LAT_MAX = 80
 ROWS = (LAT_MAX - LAT_MIN) // CELL_DEGREES
 COLS = 360 // CELL_DEGREES
 FORMAT_VERSION = 1
-MAX_RELEASE_ASSETS = 990
+MAX_RELEASE_ASSETS = 1000
 
 USER_AGENT = "LIGHT-SpotCatalog/1.0 (+https://github.com/stheil777/light-spot-catalog)"
-OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-]
-OVERPASS_PAUSE_SECONDS = 1.5
-# Ist ein Server ausgelastet (504), wird einmal gewartet und neu gefragt,
-# statt die Zelle sofort aufzugeben.
-OVERPASS_RETRY_PAUSE_SECONDS = 60
-MAX_SUBDIVISION_DEPTH = 2
-# "Zu viel" (429): eine Minute warten. Nach so vielen Absagen im ganzen Lauf
-# ist fuer heute Schluss.
-THROTTLE_PAUSE_SECONDS = 60
-MAX_THROTTLE_STRIKES = 20
-throttle_strikes = 0
-
-# Abgefragt wird je Teilzelle von 1,25 Grad, nicht die ganze 5-Grad-Zelle:
-# die ganze Zelle lief am 25.09.2026 fast immer in einen Timeout, bevor
-# zerlegt wurde, und das kostete je Zelle zwei Server mal vier Minuten.
-SUB_PER_SIDE = 4
-# Welche Teilzellen Land haben (make_land_mask.py). Meer wird nie gefragt.
-LAND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "land_cells.json")
 
 MAPTERHORN_URL = "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp"
 MAPTERHORN_ZOOMS = (13, 12)
@@ -78,12 +69,8 @@ TERRARIUM_ZOOM = 12
 TERRARIUM_TILE = 256
 FLAT_RELIEF_METERS = 20.0
 
-# Von innen nach aussen: zuerst das Rheintal und Madeira, wo die App benutzt
-# wird, dann in Ringen nach Entfernung vom Rheintal. Vorher lief ein
-# Kasten ab 30 Grad West von links nach rechts, und der Atlantik kam vor
-# Deutschland dran.
+# Rheintal: wo die App benutzt wird, kommt zuerst dran.
 HOME = (50.17, 7.70)
-FIRST = [(50.17, 7.70), (32.75, -16.95)]  # Rheintal, Madeira
 
 KEEP_TAGS = {
     "tourism", "man_made", "natural", "tower:type", "historic",
@@ -92,6 +79,19 @@ KEEP_TAGS = {
     "name:de", "name:en", "name:es", "name:fr", "name:it", "name:pt", "name:nl",
 }
 BLOCKED_ACCESS = {"private", "no", "customers"}
+
+
+
+# Gleiche Auswahl wie in osm.yml (osmium tags-filter) und wie frueher die
+# Overpass-Abfrage. osmium filtert grob, is_spot genau.
+def is_spot(tags):
+    natural = tags.get("natural")
+    return (tags.get("tourism") == "viewpoint"
+            or tags.get("man_made") == "lighthouse"
+            or natural == "beach"
+            or (tags.get("man_made") == "tower" and tags.get("tower:type") == "observation")
+            or (natural in ("peak", "cliff", "rock") and "name" in tags)
+            or (tags.get("historic") in ("castle", "ruins") and "name" in tags))
 
 
 def log(*parts):
@@ -111,12 +111,12 @@ def cell_bbox(row, col):
 
 
 def cell_of(lat, lon):
-    return int((lat - LAT_MIN) // CELL_DEGREES), int((lon + 180) // CELL_DEGREES)
+    # % COLS: Laenge 180 gehoert zur Zelle bei -180.
+    return int((lat - LAT_MIN) // CELL_DEGREES), int((lon + 180) // CELL_DEGREES) % COLS
 
 
-def land_cells():
-    with open(LAND_FILE) as handle:
-        return json.load(handle)["cells"]
+def all_cells():
+    return [cell_name(row, col) for row in range(ROWS) for col in range(COLS)]
 
 
 def distance_km(lat1, lon1, lat2, lon2):
@@ -126,138 +126,188 @@ def distance_km(lat1, lon1, lat2, lon2):
     return 6371 * 2 * math.asin(math.sqrt(a))
 
 
-def global_order():
-    """Alle Landzellen, die wichtigsten zuerst."""
-    first = [cell_of(lat, lon) for lat, lon in FIRST]
-    cells = []
-    for name in land_cells():
-        row, col = int(name[1:3]), int(name[4:6])
-        south, west, north, east = cell_bbox(row, col)
-        centre = distance_km(HOME[0], HOME[1], (south + north) / 2, (west + east) / 2)
-        rank = first.index((row, col)) if (row, col) in first else len(first)
-        cells.append(((rank, centre), (row, col)))
-    return [cell for _, cell in sorted(cells)]
+def home_distance(name):
+    south, west, north, east = cell_bbox(int(name[1:3]), int(name[4:6]))
+    return distance_km(HOME[0], HOME[1], (south + north) / 2, (west + east) / 2)
 
 
-def band_cells(band, bands):
-    # Reihum aus der Gesamtreihenfolge: jedes Band faengt nahe am Rheintal an.
-    return [cell for index, cell in enumerate(global_order()) if index % bands == band]
+# ---------------------------------------------------------------- OSM
+
+def osm_object(feature_id):
+    """osmium-ID -> (typ, id). Flaechen heissen a<2*weg> bzw. a<2*relation+1>."""
+    kind, number = feature_id[0], int(feature_id[1:])
+    if kind == "a":
+        return ("way" if number % 2 == 0 else "relation"), number // 2
+    return {"n": "node", "w": "way", "r": "relation"}[kind], number
 
 
-def sub_bboxes(row, col, subs):
-    south, west, _, _ = cell_bbox(row, col)
-    step = CELL_DEGREES / SUB_PER_SIDE
-    for sub in subs:
-        i, j = divmod(sub, SUB_PER_SIDE)
-        s, w = south + i * step, west + j * step
-        yield s, w, s + step, w + step
+def bbox_centre(geometry):
+    """Mitte des Rahmens, wie Overpass mit `out center`.
 
-
-# ---------------------------------------------------------------- Overpass
-
-def overpass_query(south, west, north, east):
-    bbox = f"{south},{west},{north},{east}"
-    # Ohne eigenes maxsize: wer 1 GB Speicher reserviert, bekommt vom Server
-    # bei Last sofort 504. Am 26.09.2026 nachgemessen, dieselbe Abfrage am
-    # Rheintal: mit 1 GB 504 nach 11 s, ohne 200 nach 2 s. Daran scheiterte
-    # der ganze erste Lauf, nicht an ueberlasteten Servern.
-    return f"""[out:json][timeout:90];
-(
-  nwr["tourism"="viewpoint"]({bbox});
-  nwr["man_made"="lighthouse"]({bbox});
-  nwr["natural"="beach"]({bbox});
-  nwr["man_made"="tower"]["tower:type"="observation"]({bbox});
-  nwr["natural"~"^(peak|cliff|rock)$"]["name"]({bbox});
-  nwr["historic"~"^(castle|ruins)$"]["name"]({bbox});
-);
-out center tags qt;"""
-
-
-class OverpassFailure(Exception):
-    pass
-
-
-class OverpassThrottled(Exception):
-    """Der Server sagt "zu viel". Dann fuer heute Schluss, nicht nachbohren."""
-
-
-class OutOfTime(Exception):
-    """Das Zeitbudget ist um, auch mitten in einer Zelle.
-
-    Am 27.09.2026 hing Band 2 ueber zwei Stunden in einer einzigen Zelle
-    (Marokko): Timeout, zerlegen, wieder Timeout. Das Budget wurde nur
-    zwischen den Zellen geprueft, die harte Job-Grenze griff zuerst, und
-    alles, was das Band in fuenf Stunden gebaut hatte, war verloren.
-    Deshalb prueft jetzt jeder einzelne Abruf die Uhr.
+    ponytail: Flaechen ueber die Datumsgrenze landen falsch (Mitte bei 0 Grad);
+    betrifft eine Handvoll Inseln im Pazifik.
     """
+    lats, lons = [], []
+    stack = [geometry["coordinates"]]
+    while stack:
+        item = stack.pop()
+        if isinstance(item[0], (int, float)):
+            lons.append(item[0])
+            lats.append(item[1])
+        else:
+            stack.extend(item)
+    return (min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2
 
 
-# Wird vom Lauf gesetzt; None heisst ohne Grenze (Tests, Fixture).
-overpass_deadline = None
+def compact(kind, number, lat, lon, tags):
+    tags = {k: v for k, v in tags.items() if k in KEEP_TAGS and isinstance(v, str)}
+    if tags.get("access") in BLOCKED_ACCESS:
+        return None
+    return {"t": kind, "i": number, "a": round(lat, 6), "o": round(lon, 6), "g": tags}
 
 
-def fetch_overpass(south, west, north, east):
-    body = urllib.parse.urlencode({"data": overpass_query(south, west, north, east)}).encode()
-    last_error = None
-    # Zwei Runden ueber beide Server, dazwischen eine Minute Pause.
-    for attempt, endpoint in enumerate(OVERPASS_ENDPOINTS * 2):
-        if overpass_deadline is not None and time.time() > overpass_deadline:
-            raise OutOfTime()
-        if attempt == len(OVERPASS_ENDPOINTS):
-            time.sleep(OVERPASS_RETRY_PAUSE_SECONDS)
-        request = urllib.request.Request(
-            endpoint,
-            data=body,
-            headers={"User-Agent": USER_AGENT,
-                     "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                payload = json.loads(response.read())
-            remark = payload.get("remark") or ""
-            if "error" in remark.lower():
-                raise OverpassFailure(remark)
-            time.sleep(OVERPASS_PAUSE_SECONDS)
-            return payload.get("elements", [])
-        except urllib.error.HTTPError as error:
-            if error.code == 429:
-                # Die Abfrage-Plaetze fuer diese Adresse sind belegt. Warten
-                # und neu fragen; erst nach mehreren Absagen fuer heute Schluss.
-                global throttle_strikes
-                throttle_strikes += 1
-                if throttle_strikes > MAX_THROTTLE_STRIKES:
-                    raise OverpassThrottled(endpoint)
-                log(f"    overpass {endpoint.split('/')[2]}: 429, warte {THROTTLE_PAUSE_SECONDS} s")
-                time.sleep(THROTTLE_PAUSE_SECONDS)
-                last_error = error
+def split_osm(path, out_dir):
+    """osmium-Export einer Region -> je Zelle eine JSON-Liste von Spots."""
+    cells = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip().lstrip("\x1e")
+            if not line:
                 continue
-            last_error = error
-            log(f"    overpass {endpoint.split('/')[2]} {south},{west}: HTTP {error.code}")
-            time.sleep(15)
-        except (urllib.error.URLError, OverpassFailure, TimeoutError, ValueError, OSError) as error:
-            last_error = error
-            log(f"    overpass {endpoint.split('/')[2]} {south},{west}: {str(error)[:120]}")
-            time.sleep(15)
-    raise OverpassFailure(str(last_error))
+            feature = json.loads(line)
+            tags = feature.get("properties") or {}
+            if not is_spot(tags) or not feature.get("geometry"):
+                continue
+            lat, lon = bbox_centre(feature["geometry"])
+            if not (LAT_MIN <= lat < LAT_MAX):
+                continue
+            spot = compact(*osm_object(feature["id"]), lat, lon, tags)
+            if spot is None:
+                continue
+            # Ein geschlossener Weg kommt als Linie und als Flaeche: einmal behalten.
+            cells.setdefault(cell_name(*cell_of(lat, lon)), {})[spot_key(spot)] = spot
+    os.makedirs(out_dir, exist_ok=True)
+    for name, spots in cells.items():
+        with open(os.path.join(out_dir, f"{name}.json"), "w", encoding="utf-8") as handle:
+            json.dump(list(spots.values()), handle, ensure_ascii=False, separators=(",", ":"))
+    log(f"{path}: {sum(len(s) for s in cells.values())} Spots in {len(cells)} Zellen")
 
 
-def elements_in(south, west, north, east, depth=0):
-    """Eine Zelle; ist sie zu dicht fuer den Server, in vier Teile zerlegen."""
-    try:
-        return fetch_overpass(south, west, north, east)
-    except OverpassFailure:
-        if depth >= MAX_SUBDIVISION_DEPTH:
-            raise
-    mid_lat = (south + north) / 2
-    mid_lon = (west + east) / 2
-    log(f"    zerlege {south},{west} (Tiefe {depth + 1})")
-    result = []
-    for s, w, n, e in (
-        (south, west, mid_lat, mid_lon), (south, mid_lon, mid_lat, east),
-        (mid_lat, west, north, mid_lon), (mid_lat, mid_lon, north, east),
-    ):
-        result.extend(elements_in(s, w, n, e, depth + 1))
-    return result
+def opl_fields(line):
+    kind, *fields = line.rstrip("\n").split(" ")
+    return kind[0], int(kind[1:]), {field[0]: field[1:] for field in fields if field}
+
+
+def opl_unescape(text):
+    return re.sub(r"%([0-9a-fA-F]+)%", lambda m: chr(int(m.group(1), 16)), text)
+
+
+def site_relations(opl_path, geo_path):
+    """Relationen, die keine Flaeche sind (Burgen als type=site), als Punkte
+    an den Export anhaengen.
+
+    osmium export kennt Relationen nur als Multipolygon. Am Rheintal fehlten
+    so am 01.10.2026 Schloss Buerresheim und Feste Kaiser Franz. Mitte des
+    Rahmens aus den Mitgliedern, wie Overpass mit `out center`. Erwartet OPL
+    aus `osmium add-locations-to-ways -n`.
+    """
+    wanted = {}
+    with open(opl_path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("r"):
+                continue
+            _, number, fields = opl_fields(line)
+            tags = dict(opl_unescape(pair).split("=", 1) for pair in fields.get("T", "").split(",")
+                        if "=" in pair)
+            if tags.get("type") == "multipolygon" or not is_spot(tags):
+                continue
+            members = [m.split("@")[0] for m in fields.get("M", "").split(",") if m[:1] in ("n", "w")]
+            wanted[number] = (tags, set(members))
+    needed = set().union(*(members for _, members in wanted.values())) if wanted else set()
+    points = {}
+    with open(opl_path, encoding="utf-8") as handle:
+        for line in handle:
+            if line[:1] not in ("n", "w"):
+                continue
+            kind, number, fields = opl_fields(line)
+            if f"{kind}{number}" not in needed:
+                continue
+            raw = [fields] if kind == "n" else [
+                {"x": node.split("x")[1].split("y")[0], "y": node.split("y")[1]}
+                for node in fields.get("N", "").split(",") if "x" in node and "y" in node]
+            points[f"{kind}{number}"] = [[float(p["x"]), float(p["y"])] for p in raw
+                                         if p.get("x") and p.get("y")]
+    added = 0
+    with open(geo_path, "a", encoding="utf-8") as out:
+        for number, (tags, members) in wanted.items():
+            coordinates = [c for m in members for c in points.get(m, [])]
+            if coordinates:
+                out.write(json.dumps({"type": "Feature", "id": f"r{number}", "properties": tags,
+                                      "geometry": {"type": "MultiPoint", "coordinates": coordinates}},
+                                     ensure_ascii=False) + "\n")
+                added += 1
+    log(f"{opl_path}: {added} von {len(wanted)} Relationen ohne Flaeche als Punkt")
+
+
+def same_place(a, b):
+    return abs(a["a"] - b["a"]) < 1e-4 and abs(a["o"] - b["o"]) < 1e-4
+
+
+def assemble_osm(osm_dir, previous_dir, out_dir):
+    """Alle Regionen zu einem Katalog. Jede Zelle der Welt bekommt einen Stand."""
+    parts = {}
+    for root, _, files in os.walk(osm_dir):
+        for file in files:
+            if file.endswith(".json"):
+                parts.setdefault(file[:-5], []).append(os.path.join(root, file))
+    if not parts:
+        sys.exit("Keine OSM-Daten")
+    os.makedirs(out_dir, exist_ok=True)
+    counts = dict.fromkeys(all_cells(), 0)
+    reused = 0
+    for name, paths in sorted(parts.items()):
+        spots = {}
+        for path in paths:
+            with open(path, encoding="utf-8") as handle:
+                for spot in json.load(handle):
+                    spots[spot_key(spot)] = spot  # Regionen ueberlappen am Rand
+        # Hoehen aus dem letzten Katalog, solange der Ort nicht gewandert ist.
+        former = {spot_key(s): s for s in (previous_spots(previous_dir, name) or {}).get("spots", [])}
+        for key, spot in spots.items():
+            old = former.get(key)
+            if old and "h" in old and same_place(old, spot):
+                spot["h"] = old["h"]
+                if "s" in old:
+                    spot["s"] = old["s"]
+                reused += 1
+        write_cell_file(os.path.join(out_dir, f"{name}.bin"),
+                        {"v": FORMAT_VERSION, "cell": name, "spots": list(spots.values())})
+        counts[name] = len(spots)
+    log(f"Hoehen uebernommen: {reused}")
+    write_manifest(out_dir, counts, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"))
+
+
+def write_manifest(out_dir, counts, osm_date):
+    # Ein Release traegt hoechstens 1000 Dateien. Darueber fallen die Zellen
+    # mit den wenigsten Spots aus dem Manifest; dort fragt die App Overpass.
+    with_spots = sorted((n for n, c in counts.items() if c), key=lambda n: -counts[n])
+    for name in with_spots[MAX_RELEASE_ASSETS - 1:]:
+        log(f"  {name}: {counts[name]} Spots, kein Platz im Release")
+        del counts[name]
+        os.remove(os.path.join(out_dir, f"{name}.bin"))
+    manifest = {
+        "version": FORMAT_VERSION,
+        "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cellDegrees": CELL_DEGREES,
+        "latMin": LAT_MIN,
+        "latMax": LAT_MAX,
+        "osm": osm_date,
+        "cells": dict(sorted(counts.items())),
+    }
+    with open(os.path.join(out_dir, "manifest.json"), "w") as handle:
+        json.dump(manifest, handle, separators=(",", ":"))
+    log(f"Katalog: {len(counts)} Zellen, {sum(1 for c in counts.values() if c)} mit Spots, "
+        f"{sum(counts.values())} Spots gesamt")
 
 
 # ---------------------------------------------------------------- Mapterhorn
@@ -413,20 +463,6 @@ def snaps_to_edge(tags):
             or tags.get("natural") == "peak")
 
 
-def compact(element):
-    tags = {k: v for k, v in (element.get("tags") or {}).items() if k in KEEP_TAGS}
-    if tags.get("access") in BLOCKED_ACCESS:
-        return None
-    if "lat" in element:
-        lat, lon = element["lat"], element["lon"]
-    elif "center" in element:
-        lat, lon = element["center"]["lat"], element["center"]["lon"]
-    else:
-        return None
-    return {"t": element["type"], "i": element["id"],
-            "a": round(lat, 6), "o": round(lon, 6), "g": tags}
-
-
 def spot_key(spot):
     return f"{spot['t']}/{spot['i']}"
 
@@ -441,16 +477,6 @@ def write_cell_file(path, payload):
     compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
     with open(path, "wb") as handle:
         handle.write(compressor.compress(raw) + compressor.flush())
-
-
-def previous_spots(previous_dir, name):
-    path = os.path.join(previous_dir or "", f"{name}.bin")
-    if not previous_dir or not os.path.exists(path):
-        return None
-    try:
-        return read_cell_file(path)
-    except Exception:
-        return None
 
 
 def resolve_height(spot, terrain, coarse, totals):
@@ -478,25 +504,31 @@ def resolve_height(spot, terrain, coarse, totals):
     totals["heights_new"] += 1
 
 
+def previous_spots(previous_dir, name):
+    path = os.path.join(previous_dir or "", f"{name}.bin")
+    if not previous_dir or not os.path.exists(path):
+        return None
+    try:
+        return read_cell_file(path)
+    except Exception:
+        return None
+
+
 def previous_manifest(previous_dir):
     path = os.path.join(previous_dir or "", "manifest.json")
     if not previous_dir or not os.path.exists(path):
-        return {"cells": {}, "crawled": {}}
+        return {"cells": {}}
     with open(path) as handle:
-        manifest = json.load(handle)
-    manifest.setdefault("crawled", {})
-    return manifest
+        return json.load(handle)
 
 
-def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
-               fixture=None, coarse_budget=40000, time_budget_minutes=290):
-    """Ein Band: die aeltesten Zellen neu aus OSM, ueberall fehlende Hoehen.
+def build_band(band, bands, previous_dir, out_dir, height_budget,
+               coarse_budget=40000, time_budget_minutes=290):
+    """Ein Band traegt fehlende Standpunkthoehen nach, Rheintal zuerst.
 
-    Overpass bittet um hoechstens 10 000 Abfragen und rund 1 GB am Tag. Die
-    ganze Welt an einem Tag waere darueber. Deshalb holt jeder Lauf nur
-    `crawl_cells` Zellen je Band neu, nie gesehene und Europa zuerst, danach
-    die mit dem aeltesten Stand. Nach etwa fuenf Tagen ist die Welt einmal
-    durch, danach frischt sich jede Zelle im gleichen Takt auf.
+    Mapterhorn wird von Freiwilligen betrieben: je Band und Tag nur
+    `height_budget` Kacheln. Geaendert wird nur, was eine Hoehe bekommt; der
+    Rest kommt beim Zusammenbauen aus dem letzten Katalog.
     """
     os.makedirs(out_dir, exist_ok=True)
     cache = os.path.join(out_dir, "..", ".terrain-cache")
@@ -504,224 +536,169 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, crawl_cells,
     coarse = Terrain(cache, coarse_budget, url=TERRARIUM_URL, tile_size=TERRARIUM_TILE,
                      zooms=(TERRARIUM_ZOOM,), suffix="png")
     old = previous_manifest(previous_dir)
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    cells_out, crawled_out = {}, {}
+    names = sorted((n for n, c in old["cells"].items() if c), key=home_distance)[band::bands]
     started = time.time()
-    totals = {"crawled": 0, "kept": 0, "spots": 0, "heights_new": 0, "heights_flat": 0,
-              "heights_reused": 0, "heights_missing": 0, "failed": 0}
-
-    land = land_cells()
-    order = band_cells(band, bands)
-    rank = {cell: index for index, cell in enumerate(order)}
-    # Nie gesehen zuerst (Rheintal vorn, band_cells sortiert schon so), dann
-    # nach Alter des letzten Standes.
-    order.sort(key=lambda cell: (
-        cell_name(*cell) in old["crawled"],
-        old["crawled"].get(cell_name(*cell), ""),
-        rank[cell],
-    ))
-    to_crawl = set(order[:crawl_cells])
-    throttled = False
-    # Rechtzeitig aufhoeren und speichern. Am 25.09.2026 wurde Band 0 an der
-    # Zeitgrenze des Laufs abgebrochen, und alles Gefundene war verloren.
     deadline = started + time_budget_minutes * 60
-    global overpass_deadline
-    overpass_deadline = deadline
-    out_of_time = False
+    cells_out = {}
+    totals = {"heights_new": 0, "heights_flat": 0, "heights_missing": 0}
 
-    # Crawl-Zellen zuerst, damit ein Abbruch wegen "zu viel" nur sie trifft.
-    for row, col in sorted(order, key=lambda cell: (cell not in to_crawl, order.index(cell))):
-        name = cell_name(row, col)
-        south, west, north, east = cell_bbox(row, col)
-        previous = previous_spots(previous_dir, name)
-        if not out_of_time and time.time() > deadline:
-            out_of_time = True
-            log(f"  Zeitbudget ({time_budget_minutes} min) erreicht: Rest behaelt den alten Stand")
-        crawl = (row, col) in to_crawl and not throttled and not out_of_time
-
-        elements = None
-        if crawl:
-            try:
-                if fixture is not None:
-                    elements = [e for e in fixture
-                                if south <= (e.get("lat") or e.get("center", {}).get("lat", 999)) < north
-                                and west <= (e.get("lon") or e.get("center", {}).get("lon", 999)) < east]
-                else:
-                    # Erst zuweisen, wenn alle Teile da sind. Am 26.09.2026
-                    # kam mitten in der Zelle "zu viel", und die halbe Zelle
-                    # wurde als ganze gespeichert: ohne Loreley.
-                    collected = []
-                    for sub in sub_bboxes(row, col, land[name]):
-                        collected.extend(elements_in(*sub))
-                    elements = collected
-            except OutOfTime:
-                out_of_time = True
-                log(f"  {name}: Zeitbudget ({time_budget_minutes} min) mitten in der Zelle erreicht, "
-                    "Rest behaelt den alten Stand")
-            except OverpassThrottled as error:
-                throttled = True
-                log(f"  {name}: Overpass sagt 'zu viel' ({error}), OSM-Abruf fuer heute beendet")
-            except OverpassFailure as error:
-                totals["failed"] += 1
-                log(f"  {name}: Overpass aus ({str(error)[:100]})")
-
-        if elements is None:
-            # Nicht dran oder fehlgeschlagen: Stand der Vorwoche behalten und
-            # nur Hoehen nachtragen. Ohne Vorwoche bleibt die Zelle aussen
-            # vor, dann fragt die App dort selbst Overpass.
-            if previous is None:
-                if name in old["cells"] and old["cells"][name] == 0:
-                    cells_out[name] = 0
-                    crawled_out[name] = old["crawled"].get(name, "")
-                continue
-            for spot in previous.get("spots", []):
-                if needs_height(spot["g"]) and "h" not in spot and not out_of_time:
-                    resolve_height(spot, terrain, coarse, totals)
-                    if "h" not in spot:
-                        totals["heights_missing"] += 1
-            write_cell_file(os.path.join(out_dir, f"{name}.bin"), previous)
-            cells_out[name] = len(previous.get("spots", []))
-            crawled_out[name] = old["crawled"].get(name, "")
-            totals["kept"] += 1
-            totals["spots"] += cells_out[name]
+    for name in names:
+        if time.time() > deadline or coarse.exhausted:
+            log(f"  Zeit oder Budget um bei {name}: Rest morgen")
+            break
+        payload = previous_spots(previous_dir, name)
+        if payload is None:
             continue
+        before = totals["heights_new"] + totals["heights_flat"]
+        for spot in payload.get("spots", []):
+            if needs_height(spot["g"]) and "h" not in spot and time.time() <= deadline:
+                resolve_height(spot, terrain, coarse, totals)
+                if "h" not in spot:
+                    totals["heights_missing"] += 1
+        if totals["heights_new"] + totals["heights_flat"] > before:
+            write_cell_file(os.path.join(out_dir, f"{name}.bin"), payload)
+            cells_out[name] = len(payload["spots"])
+            # Nach jeder Zelle sichern: wird das Band abgebrochen, laedt der
+            # Workflow den Zwischenstand trotzdem hoch.
+            save_band_manifest(out_dir, band, cells_out)
 
-        reuse = {spot_key(spot): spot for spot in (previous or {}).get("spots", [])}
-        spots, seen = [], set()
-        for element in elements:
-            spot = compact(element)
-            if spot is None or spot_key(spot) in seen:
-                continue
-            seen.add(spot_key(spot))
-            if needs_height(spot["g"]) and time.time() <= deadline:
-                former = reuse.get(spot_key(spot))
-                if former and former["a"] == spot["a"] and former["o"] == spot["o"] and "h" in former:
-                    spot["h"] = former["h"]
-                    if "s" in former:
-                        spot["s"] = former["s"]
-                    totals["heights_reused"] += 1
-                else:
-                    resolve_height(spot, terrain, coarse, totals)
-                    if "h" not in spot:
-                        totals["heights_missing"] += 1
-            spots.append(spot)
-
-        cells_out[name] = len(spots)
-        crawled_out[name] = today
-        totals["crawled"] += 1
-        totals["spots"] += len(spots)
-        if spots:
-            write_cell_file(os.path.join(out_dir, f"{name}.bin"),
-                            {"v": FORMAT_VERSION, "cell": name, "spots": spots})
-            log(f"  {name}: {len(spots)} Spots (neu aus OSM)")
-        # Nach jeder neuen Zelle sichern: wird das Band doch abgebrochen,
-        # laedt der Workflow den Zwischenstand trotzdem hoch, und was fehlt,
-        # kommt beim Zusammenbauen aus der Vorwoche.
-        save_band_manifest(out_dir, band, cells_out, crawled_out)
-
-    save_band_manifest(out_dir, band, cells_out, crawled_out)
-    log(f"Band {band}: {totals} · Mapterhorn {terrain.downloads} Kacheln · "
-        f"AWS {coarse.downloads} Kacheln · {int(time.time() - started)} s")
+    save_band_manifest(out_dir, band, cells_out)
+    log(f"Band {band}: {len(cells_out)} Zellen geaendert, {totals} · Mapterhorn "
+        f"{terrain.downloads} Kacheln · AWS {coarse.downloads} Kacheln · "
+        f"{int(time.time() - started)} s")
 
 
-def save_band_manifest(out_dir, band, cells, crawled):
+def save_band_manifest(out_dir, band, cells):
     path = os.path.join(out_dir, f"manifest-band{band}.json")
     with open(path + ".tmp", "w") as handle:
-        json.dump({"cells": cells, "crawled": crawled}, handle)
+        json.dump({"cells": cells}, handle)
     os.replace(path + ".tmp", path)
 
 
 def assemble(bands_dir, previous_dir, out_dir):
+    """Hoehen-Lauf: geaenderte Zellen aus den Baendern, der Rest wie gehabt."""
+    old = previous_manifest(previous_dir)
+    if not old["cells"]:
+        sys.exit("Kein Katalog zum Ergaenzen; erst osm.yml laufen lassen")
     os.makedirs(out_dir, exist_ok=True)
-    cells, crawled = {}, {}
-    for entry in sorted(os.listdir(bands_dir)):
+    counts = dict(old["cells"])
+    for entry in os.listdir(bands_dir):
         if entry.startswith("manifest-band") and entry.endswith(".json"):
             with open(os.path.join(bands_dir, entry)) as handle:
-                band = json.load(handle)
-            cells.update(band.get("cells", {}))
-            crawled.update(band.get("crawled", {}))
-
-    # Ein komplett ausgefallenes Band: die Vorwoche springt ein.
-    previous_manifest = None
-    if previous_dir and os.path.exists(os.path.join(previous_dir, "manifest.json")):
-        with open(os.path.join(previous_dir, "manifest.json")) as handle:
-            previous_manifest = json.load(handle)
-    if previous_manifest:
-        for name, count in previous_manifest.get("cells", {}).items():
-            if name in cells:
-                continue
-            source = os.path.join(previous_dir, f"{name}.bin")
-            if count == 0 or os.path.exists(source):
-                cells[name] = count
-                crawled[name] = previous_manifest.get("crawled", {}).get(name, "")
-                if count:
-                    with open(source, "rb") as src, open(os.path.join(bands_dir, f"{name}.bin"), "wb") as dst:
-                        dst.write(src.read())
-
-    # Meer: bekannt und leer. Sonst hielte die App eine Suche an der Kueste
-    # fuer "Katalog weiss es nicht" und fragte wieder selbst Overpass.
-    land = land_cells()
-    for row in range(ROWS):
-        for col in range(COLS):
-            name = cell_name(row, col)
-            if name not in land:
-                cells.setdefault(name, 0)
-
-    assets = [name for name, count in cells.items() if count > 0]
-    if len(assets) + 1 > MAX_RELEASE_ASSETS:
-        sys.exit(f"{len(assets)} Kacheln: mehr als ein Release tragen kann")
-    if not cells:
-        sys.exit("Kein einziges Band hat geliefert")
-
-    for name in assets:
-        with open(os.path.join(bands_dir, f"{name}.bin"), "rb") as src, \
-                open(os.path.join(out_dir, f"{name}.bin"), "wb") as dst:
-            dst.write(src.read())
-
-    manifest = {
-        "version": FORMAT_VERSION,
-        "built": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "cellDegrees": CELL_DEGREES,
-        "latMin": LAT_MIN,
-        "latMax": LAT_MAX,
-        "cells": dict(sorted(cells.items())),
-        "crawled": dict(sorted(crawled.items())),
-    }
-    with open(os.path.join(out_dir, "manifest.json"), "w") as handle:
-        json.dump(manifest, handle, separators=(",", ":"))
-    log(f"Katalog: {len(cells)} Zellen, {len(assets)} mit Spots, "
-        f"{sum(cells.values())} Spots gesamt")
+                counts.update(json.load(handle)["cells"])
+    for name, count in list(counts.items()):
+        if not count:
+            continue
+        for source in (os.path.join(bands_dir, f"{name}.bin"),
+                       os.path.join(previous_dir, f"{name}.bin")):
+            if os.path.exists(source):
+                shutil.copyfile(source, os.path.join(out_dir, f"{name}.bin"))
+                break
+        else:
+            # Ohne Datei raus aus dem Manifest: die App fragt dort Overpass.
+            del counts[name]
+    write_manifest(out_dir, counts, old.get("osm", ""))
 
 
 def status(release_dir, failed_bands=""):
     """Kurzer Stand fuer das Issue 'Katalog-Status', in Markdown."""
     with open(os.path.join(release_dir, "manifest.json")) as handle:
         manifest = json.load(handle)
-    land = land_cells()
     cells = manifest["cells"]
-    done = sum(1 for name in land if name in cells)
-    with_spots = sum(1 for count in cells.values() if count > 0)
-    total = sum(cells.values())
-
-    home = cell_name(*cell_of(*HOME))
+    with_spots = [n for n, c in cells.items() if c]
+    need = have = 0
     loreley = False
-    path = os.path.join(release_dir, f"{home}.bin")
-    if os.path.exists(path):
-        with open(path, "rb") as handle:
-            spots = json.loads(zlib.decompress(handle.read(), -15))["spots"]
-        loreley = any("lorele" in spot["g"].get("name", "").lower() for spot in spots)
+    home = cell_name(*cell_of(*HOME))
+    for name in with_spots:
+        spots = read_cell_file(os.path.join(release_dir, f"{name}.bin"))["spots"]
+        for spot in spots:
+            if needs_height(spot["g"]):
+                need += 1
+                have += "h" in spot
+        if name == home:
+            loreley = any("lorele" in s["g"].get("name", "").lower() for s in spots)
+    missing = [n for n in all_cells() if n not in cells]
 
     lines = [
-        f"**{manifest['built'][:10]}** · {done} von {len(land)} Landzellen "
-        f"({round(100 * done / len(land))} %) · {with_spots} Kacheln mit Spots · {total} Spots",
+        f"**{manifest['built'][:10]}** · OSM-Stand {manifest.get('osm') or 'alt (Overpass)'} · "
+        f"{len(with_spots)} Kacheln mit Spots · {sum(cells.values())} Spots",
+        f"- Standpunkthoehen: {have} von {need} ({round(100 * have / max(need, 1))} %)",
         f"- Rheintal ({home}): "
-        + (f"{cells[home]} Spots · Loreley: {'ja' if loreley else 'nein'}" if home in cells else "noch nicht drin"),
+        + (f"{cells[home]} Spots · Loreley: {'ja' if loreley else 'nein'}" if cells.get(home) else "nicht drin"),
     ]
+    if missing:
+        lines.append(f"- Nicht im Katalog (App fragt dort Overpass): {len(missing)} Zellen")
     if failed_bands:
-        lines.append(f"- Ausgefallen: {failed_bands} (deren Zellen behalten den alten Stand)")
-    if done == len(land):
-        lines.append("- Die Welt ist einmal komplett drin. Ab jetzt wird nur noch aufgefrischt.")
+        lines.append(f"- Ausgefallen: {failed_bands} (deren Hoehen kommen morgen)")
     print("\n".join(lines))
+
+
+def selftest():
+    """Kleiner Durchlauf ohne Netz: Auswahl, IDs, Zusammenbau, Hoehen, Grenze."""
+    global MAX_RELEASE_ASSETS
+    features = [
+        {"id": "n1", "geometry": {"type": "Point", "coordinates": [7.73, 50.14]},
+         "properties": {"tourism": "viewpoint", "name": "Loreley"}},
+        {"id": "n2", "geometry": {"type": "Point", "coordinates": [7.5, 50.1]},
+         "properties": {"natural": "peak"}},  # ohne Namen: raus
+        {"id": "n3", "geometry": {"type": "Point", "coordinates": [7.6, 50.2]},
+         "properties": {"tourism": "viewpoint", "access": "private"}},  # privat: raus
+        {"id": "w2", "geometry": {"type": "LineString", "coordinates": [[7.0, 50.0], [7.2, 50.4]]},
+         "properties": {"natural": "beach"}},
+        {"id": "a4", "geometry": {"type": "MultiPolygon", "coordinates": [[[[7.0, 50.0], [7.2, 50.4], [7.0, 50.4], [7.0, 50.0]]]]},
+         "properties": {"natural": "beach"}},  # derselbe Weg 2 als Flaeche
+        {"id": "a7", "geometry": {"type": "MultiPolygon", "coordinates": [[[[-16.9, 32.6], [-16.8, 32.7], [-16.9, 32.7], [-16.9, 32.6]]]]},
+         "properties": {"historic": "castle", "name": "Fortaleza"}},
+        {"id": "n4", "geometry": {"type": "Point", "coordinates": [180.0, 10.0]},
+         "properties": {"man_made": "lighthouse"}},
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        geo = os.path.join(tmp, "x.geojsonseq")
+        with open(geo, "w") as handle:
+            handle.write("".join("\x1e" + json.dumps(f) + "\n" for f in features))
+        opl = os.path.join(tmp, "x.opl")
+        with open(opl, "w") as handle:
+            handle.write("n9 v1 dV c0 t i0 u T x7.6 y50.3\n"
+                         "w8 v1 dV c0 t i0 u Tbuilding=yes Nn10x7.5y50.25,n11x7.7y50.35\n"
+                         "r5 v1 dV c0 t i0 u Thistoric=castle,name=Feste%20%Franz,type=site Mw8@,n9@label,r6@\n"
+                         "r6 v1 dV c0 t i0 u Thistoric=castle,name=X,type=multipolygon Mw8@outer\n")
+        site_relations(opl, geo)
+        split_osm(geo, os.path.join(tmp, "osm", "a"))
+        split_osm(geo, os.path.join(tmp, "osm", "b"))  # Ueberlappung
+        prev = os.path.join(tmp, "prev")
+        os.makedirs(prev)
+        write_cell_file(os.path.join(prev, "c22_37.bin"), {"spots": [
+            {"t": "node", "i": 1, "a": 50.14001, "o": 7.73, "g": {}, "h": 192.0, "s": [50.1401, 7.7301]}]})
+        assemble_osm(os.path.join(tmp, "osm"), prev, os.path.join(tmp, "rel"))
+        with open(os.path.join(tmp, "rel", "manifest.json")) as handle:
+            manifest = json.load(handle)
+        assert len(manifest["cells"]) == ROWS * COLS
+        assert manifest["cells"]["c22_37"] == 3, manifest["cells"]["c22_37"]  # Loreley, Strand, Feste
+        spots = {spot_key(s): s for s in read_cell_file(os.path.join(tmp, "rel", "c22_37.bin"))["spots"]}
+        assert set(spots) == {"node/1", "way/2", "relation/5"}, set(spots)
+        assert spots["relation/5"]["g"]["name"] == "Feste Franz"
+        assert (spots["relation/5"]["a"], spots["relation/5"]["o"]) == (50.3, 7.6)
+        assert spots["node/1"]["h"] == 192.0 and spots["node/1"]["s"] == [50.1401, 7.7301]
+        assert spots["way/2"]["a"] == 50.2 and spots["way/2"]["o"] == 7.1
+        assert manifest["cells"][cell_name(*cell_of(32.65, -16.85))] == 1
+        assert "relation/3" in {spot_key(s) for s in read_cell_file(
+            os.path.join(tmp, "rel", cell_name(*cell_of(32.65, -16.85)) + ".bin"))["spots"]}
+        assert manifest["cells"][cell_name(*cell_of(10.0, -180.0))] == 1  # Datumsgrenze
+
+        # Hoehen-Lauf ohne Baender: alles bleibt, wie es war.
+        os.makedirs(os.path.join(tmp, "bands"))
+        assemble(os.path.join(tmp, "bands"), os.path.join(tmp, "rel"), os.path.join(tmp, "rel2"))
+        with open(os.path.join(tmp, "rel2", "manifest.json")) as handle:
+            assert json.load(handle)["cells"] == manifest["cells"]
+
+        # Zu viele Zellen fuers Release: die kleinsten fliegen raus.
+        MAX_RELEASE_ASSETS = 3
+        assemble(os.path.join(tmp, "bands"), os.path.join(tmp, "rel"), os.path.join(tmp, "rel3"))
+        with open(os.path.join(tmp, "rel3", "manifest.json")) as handle:
+            cells = json.load(handle)["cells"]
+        assert sum(1 for c in cells.values() if c) == 2 and cells["c22_37"] == 3
+        assert len([f for f in os.listdir(os.path.join(tmp, "rel3")) if f.endswith(".bin")]) == 2
+    log("Selbsttest ok")
 
 
 def main():
@@ -731,28 +708,34 @@ def main():
     parser.add_argument("--previous")
     parser.add_argument("--out")
     parser.add_argument("--assemble")
+    parser.add_argument("--split-osm", help="osmium-Export (geojsonseq) einer Region")
+    parser.add_argument("--assemble-osm", help="Ordner mit allen Regionen")
+    parser.add_argument("--site-relations", nargs=2, metavar=("OPL", "GEOJSONSEQ"),
+                        help="Relationen ohne Flaeche an den Export anhaengen")
     parser.add_argument("--status", help="Release-Ordner: Stand als Markdown ausgeben")
     parser.add_argument("--failed-bands", default="")
+    parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--height-budget", type=int, default=2000,
-                        help="Hoehenkacheln pro Lauf; schont Mapterhorn")
-    parser.add_argument("--fixture", help="Overpass-JSON statt Netz (Test)")
-    parser.add_argument("--crawl-cells", type=int, default=70,
-                        help="Zellen je Band und Lauf neu aus OSM; schont Overpass")
+                        help="Mapterhorn-Kacheln je Band und Lauf")
     parser.add_argument("--time-budget", type=int, default=290,
                         help="Minuten; danach nur noch speichern")
     args = parser.parse_args()
 
-    if args.status:
+    if args.selftest:
+        selftest()
+    elif args.site_relations:
+        site_relations(*args.site_relations)
+    elif args.split_osm:
+        split_osm(args.split_osm, args.out)
+    elif args.assemble_osm:
+        assemble_osm(args.assemble_osm, args.previous, args.out)
+    elif args.status:
         status(args.status, args.failed_bands)
     elif args.assemble:
         assemble(args.assemble, args.previous, args.out)
     else:
-        fixture = None
-        if args.fixture:
-            with open(args.fixture) as handle:
-                fixture = json.load(handle)["elements"]
         build_band(args.band, args.bands, args.previous, args.out, args.height_budget,
-                   args.crawl_cells, fixture, time_budget_minutes=args.time_budget)
+                   time_budget_minutes=args.time_budget)
 
 
 if __name__ == "__main__":

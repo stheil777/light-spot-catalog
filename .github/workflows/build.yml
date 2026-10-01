@@ -1,16 +1,13 @@
 name: Spot-Katalog bauen
 
-# Laeuft von allein, jeden Tag frueh. Jeder Lauf holt bis zu ~420 Zellen neu
-# aus OSM (nur Zellen mit Land, siehe land_cells.json; nie gesehene zuerst,
-# vom Rheintal und Madeira nach aussen, dann die aeltesten) und traegt
-# fehlende Standpunkthoehen nach. Nach ~3 Tagen ist die Welt einmal durch.
+# Laeuft jeden Tag und traegt fehlende Standpunkthoehen nach (Rheintal
+# zuerst). Die Orte selbst kommen einmal die Woche aus osm.yml.
 # Jedes Band hoert nach 290 Minuten auf und speichert, was es hat.
 #
 # Budgets, damit niemand die App sperrt:
-# - Overpass: ~420 Abfragen, ~300 MB am Tag (erbeten: <10 000 und <1 GB).
-#   Bei "429 zu viel" hoert der Lauf mit OSM sofort auf.
 # - Mapterhorn: 2000 Kacheln je Band, nur fuer Spots am Hang.
 #   Bei 403/429/503 ist fuer den Tag Schluss.
+# - AWS Terrarium (grobe Hoehen, von Amazon gesponsert): 40 000 je Band.
 # Von Hand: "Actions -> Spot-Katalog bauen -> Run workflow".
 on:
   push:
@@ -39,8 +36,7 @@ jobs:
     timeout-minutes: 340
     strategy:
       fail-fast: false
-      # Zwei gleichzeitig: Overpass erlaubt zwei Abfragen parallel, mehr
-      # waere unhoeflich gegenueber den Betreibern.
+      # Zwei gleichzeitig: Mapterhorn wird von Freiwilligen betrieben.
       max-parallel: 2
       matrix:
         band: [0, 1, 2, 3, 4, 5]
@@ -62,7 +58,7 @@ jobs:
         timeout-minutes: 320
         run: |
           python build_catalog.py --band ${{ matrix.band }} --bands 6 \
-            --previous previous --out out --crawl-cells 70 --height-budget 2000 \
+            --previous previous --out out --height-budget 2000 \
             --time-budget 290
       # Auch nach Abbruch oder Fehler: jede fertige Zelle zaehlt.
       - uses: actions/upload-artifact@v7
@@ -75,7 +71,7 @@ jobs:
   release:
     name: Veroeffentlichen
     needs: band
-    # Auch wenn ein Band ausfaellt: dessen Zellen kommen aus der Vorwoche.
+    # Auch wenn ein Band ausfaellt: dessen Zellen bleiben wie im letzten Katalog.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -100,30 +96,10 @@ jobs:
             || echo "Noch kein Katalog veroeffentlicht"
       - name: Zusammensetzen
         run: python build_catalog.py --assemble bands --previous previous --out release
-      - name: Als Release veroeffentlichen
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="catalog-$(date -u +%Y%m%d-%H%M)"
-          gh release create "$TAG" release/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Spot-Katalog $(date -u +%Y-%m-%d)" \
-            --notes "Daten © OpenStreetMap-Mitwirkende, ODbL. Standpunkthoehen: Mapterhorn (https://mapterhorn.com/attribution)." \
-            --latest
-          # Nur die zwei neuesten Kataloge behalten. Nach Tag sortieren (catalog-JJJJMMTT-HHMM):
-          # createdAt ist das Commit-Datum und bei allen Releases gleich.
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
-            --jq 'sort_by(.tagName) | reverse | .[2:] | .[].tagName' \
-            | while read -r old; do
-                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-              done
-      - name: Stand ins Issue 'Katalog-Status' schreiben
-        if: ${{ !cancelled() }}
+      - name: Veroeffentlichen
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           FAILED=$(gh run view ${{ github.run_id }} --repo "$GITHUB_REPOSITORY" --json jobs \
             --jq '[.jobs[] | select(.name | startswith("Band")) | select(.conclusion != "success") | .name] | join(", ")')
-          python build_catalog.py --status release --failed-bands "$FAILED" > status.md
-          cat status.md
-          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file status.md
+          ./publish.sh "$FAILED"
