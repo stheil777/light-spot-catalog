@@ -110,9 +110,10 @@ jobs:
             --title "Spot-Katalog $(date -u +%Y-%m-%d)" \
             --notes "Daten © OpenStreetMap-Mitwirkende, ODbL. Standpunkthoehen: Mapterhorn (https://mapterhorn.com/attribution)." \
             --latest
-          # Nur die zwei neuesten Kataloge behalten.
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].tagName' \
+          # Nur die zwei neuesten Kataloge behalten. Nach Tag sortieren (catalog-JJJJMMTT-HHMM):
+          # createdAt ist das Commit-Datum und bei allen Releases gleich.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
+            --jq 'sort_by(.tagName) | reverse | .[2:] | .[].tagName' \
             | while read -r old; do
                 gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
               done
