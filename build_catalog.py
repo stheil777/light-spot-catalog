@@ -253,8 +253,13 @@ def same_place(a, b):
     return abs(a["a"] - b["a"]) < 1e-4 and abs(a["o"] - b["o"]) < 1e-4
 
 
-def assemble_osm(osm_dir, previous_dir, out_dir):
-    """Alle Regionen zu einem Katalog. Jede Zelle der Welt bekommt einen Stand."""
+def assemble_osm(osm_dir, previous_dir, out_dir, partial=False):
+    """Alle Regionen zu einem Katalog. Jede Zelle der Welt bekommt einen Stand.
+
+    partial: nur einige Regionen geholt (z. B. erst Europa). Dann behalten alle
+    anderen Zellen den letzten Stand, und Randzellen behalten die Spots aus dem
+    Nachbarland, die die Region nicht enthaelt.
+    """
     parts = {}
     for root, _, files in os.walk(osm_dir):
         for file in files:
@@ -263,7 +268,18 @@ def assemble_osm(osm_dir, previous_dir, out_dir):
     if not parts:
         sys.exit("Keine OSM-Daten")
     os.makedirs(out_dir, exist_ok=True)
-    counts = dict.fromkeys(all_cells(), 0)
+    if partial:
+        counts = dict(previous_manifest(previous_dir)["cells"])
+        for name, count in list(counts.items()):
+            if name in parts or not count:
+                continue
+            source = os.path.join(previous_dir, f"{name}.bin")
+            if os.path.exists(source):
+                shutil.copyfile(source, os.path.join(out_dir, f"{name}.bin"))
+            else:
+                del counts[name]
+    else:
+        counts = dict.fromkeys(all_cells(), 0)
     reused = 0
     for name, paths in sorted(parts.items()):
         spots = {}
@@ -280,11 +296,15 @@ def assemble_osm(osm_dir, previous_dir, out_dir):
                 if "s" in old:
                     spot["s"] = old["s"]
                 reused += 1
+        if partial:
+            for key, old in former.items():
+                spots.setdefault(key, old)
         write_cell_file(os.path.join(out_dir, f"{name}.bin"),
                         {"v": FORMAT_VERSION, "cell": name, "spots": list(spots.values())})
         counts[name] = len(spots)
     log(f"Hoehen uebernommen: {reused}")
-    write_manifest(out_dir, counts, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"))
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    write_manifest(out_dir, counts, f"{today} (teilweise)" if partial else today)
 
 
 def write_manifest(out_dir, counts, osm_date):
@@ -691,6 +711,17 @@ def selftest():
         with open(os.path.join(tmp, "rel2", "manifest.json")) as handle:
             assert json.load(handle)["cells"] == manifest["cells"]
 
+        # Teil-Lauf: nur Region "a" neu, Madeira (nicht drin) bleibt, fremde Spots am Rand bleiben.
+        os.makedirs(os.path.join(tmp, "osm2", "a"))
+        with open(os.path.join(tmp, "osm2", "a", "c22_37.json"), "w") as handle:
+            json.dump([{"t": "node", "i": 99, "a": 50.5, "o": 7.5, "g": {"tourism": "viewpoint"}}], handle)
+        assemble_osm(os.path.join(tmp, "osm2"), os.path.join(tmp, "rel"), os.path.join(tmp, "rel4"), partial=True)
+        with open(os.path.join(tmp, "rel4", "manifest.json")) as handle:
+            part = json.load(handle)
+        assert part["cells"]["c22_37"] == 4 and part["osm"].endswith("(teilweise)")
+        assert part["cells"][cell_name(*cell_of(32.65, -16.85))] == 1
+        assert os.path.exists(os.path.join(tmp, "rel4", cell_name(*cell_of(32.65, -16.85)) + ".bin"))
+
         # Zu viele Zellen fuers Release: die kleinsten fliegen raus.
         MAX_RELEASE_ASSETS = 3
         assemble(os.path.join(tmp, "bands"), os.path.join(tmp, "rel"), os.path.join(tmp, "rel3"))
@@ -710,6 +741,8 @@ def main():
     parser.add_argument("--assemble")
     parser.add_argument("--split-osm", help="osmium-Export (geojsonseq) einer Region")
     parser.add_argument("--assemble-osm", help="Ordner mit allen Regionen")
+    parser.add_argument("--partial", action="store_true",
+                        help="nur einige Regionen: Rest bleibt wie im letzten Katalog")
     parser.add_argument("--site-relations", nargs=2, metavar=("OPL", "GEOJSONSEQ"),
                         help="Relationen ohne Flaeche an den Export anhaengen")
     parser.add_argument("--status", help="Release-Ordner: Stand als Markdown ausgeben")
@@ -728,7 +761,7 @@ def main():
     elif args.split_osm:
         split_osm(args.split_osm, args.out)
     elif args.assemble_osm:
-        assemble_osm(args.assemble_osm, args.previous, args.out)
+        assemble_osm(args.assemble_osm, args.previous, args.out, args.partial)
     elif args.status:
         status(args.status, args.failed_bands)
     elif args.assemble:
