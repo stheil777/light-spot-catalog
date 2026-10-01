@@ -58,8 +58,13 @@ jobs:
           df -h / /mnt || true
       - name: Herunterladen
         run: |
-          URL="https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf"
           UA="LIGHT-SpotCatalog/1.0 (+https://github.com/stheil777/light-spot-catalog)"
+          # "latest" leitet auf die Datei mit Datum weiter. Die feste Datei
+          # holen: am 01.10.2026 kam waehrend des Downloads eine neue heraus,
+          # und die Pruefsumme zu "latest" gab 404.
+          URL=$(curl -fsSIL --retry 5 -A "$UA" -o /dev/null -w '%{url_effective}' \
+            "https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf")
+          echo "$URL"
           curl -fsSL --retry 5 --retry-all-errors -A "$UA" -o "$WORK/region.osm.pbf" "$URL" \
             -w "%{size_download} Bytes in %{time_total} s (%{speed_download} B/s)\n"
           curl -fsSL --retry 5 -A "$UA" "$URL.md5" | awk -v f="$WORK/region.osm.pbf" '{print $1"  "f}' | md5sum -c -
