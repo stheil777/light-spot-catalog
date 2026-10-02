@@ -20,6 +20,10 @@ on:
         description: 'Nur diese Regionen, z. B. ["europe"]; leer = ganze Welt'
         required: false
         default: ""
+      from_run:
+        description: 'Regionen nicht neu laden, sondern aus diesem Lauf nehmen (Run-ID)'
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +36,7 @@ concurrency:
 jobs:
   region:
     name: OSM ${{ matrix.region }}
+    if: ${{ !inputs.from_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -96,8 +101,10 @@ jobs:
   release:
     name: Veroeffentlichen
     needs: region
+    if: ${{ !cancelled() && (needs.region.result == 'success' || inputs.from_run) }}
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       issues: write
     steps:
@@ -110,6 +117,8 @@ jobs:
           path: osm
           pattern: osm-*
           merge-multiple: true
+          run-id: ${{ inputs.from_run || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Letzten Katalog holen (fuer die Hoehen)
         env:
           GH_TOKEN: ${{ github.token }}
