@@ -65,7 +65,11 @@ jobs:
           URL=$(curl -fsSIL --retry 5 -A "$UA" -o /dev/null -w '%{url_effective}' \
             "https://download.geofabrik.de/${{ matrix.region }}-latest.osm.pbf")
           echo "$URL"
-          curl -fsSL --retry 5 --retry-all-errors -A "$UA" -o "$WORK/region.osm.pbf" "$URL" \
+          # Haengt die Verbindung (unter 2 MB/s fuer 2 Minuten), neu verbinden und
+          # weiterladen. Am 01.10.2026 krochen Asien und Nordamerika mit 1 MB/s
+          # in die 5-Stunden-Grenze, Europa kam mit 58 MB/s in 10 Minuten.
+          curl -fsSL --retry 20 --retry-all-errors -C - --speed-limit 2000000 --speed-time 120 \
+            -A "$UA" -o "$WORK/region.osm.pbf" "$URL" \
             -w "%{size_download} Bytes in %{time_total} s (%{speed_download} B/s)\n"
           curl -fsSL --retry 5 -A "$UA" "$URL.md5" | awk -v f="$WORK/region.osm.pbf" '{print $1"  "f}' | md5sum -c -
           ls -la "$WORK/region.osm.pbf"
