@@ -120,12 +120,7 @@ jobs:
           run-id: ${{ inputs.from_run || github.run_id }}
           github-token: ${{ github.token }}
       - name: Letzten Katalog holen (fuer die Hoehen)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p previous
-          gh release download --repo "$GITHUB_REPOSITORY" --pattern "*" --dir previous \
-            || echo "Noch kein Katalog veroeffentlicht"
+        run: ./fetch_previous.sh
       - name: Zusammensetzen
         run: |
           python build_catalog.py --assemble-osm osm --previous previous --out release \
