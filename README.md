@@ -8,7 +8,7 @@ OSM-Komplettdaten von [Geofabrik](https://download.geofabrik.de/): je Kontinent
 herunterladen, mit osmium auf die Spot-Arten filtern, in 5-Grad-Zellen
 schneiden. Danach kennt der Katalog jede Zelle zwischen 60° Süd und 80° Nord.
 Jeden Tag (`build.yml`) werden fehlende Standpunkthöhen nachgetragen,
-Rheintal zuerst, in festen Budgets. Jeder Lauf wird als Release veröffentlicht,
+Rheintal zuerst, aus den PMTiles-Archiven von Mapterhorn. Jeder Lauf wird als Release veröffentlicht,
 der Stand steht danach in Issue #1. Die App lädt nur die 5°-Kacheln rund um
 den Suchort:
 

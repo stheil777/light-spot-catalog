@@ -54,20 +54,17 @@ MAX_RELEASE_ASSETS = 1000
 
 USER_AGENT = "LIGHT-SpotCatalog/1.0 (+https://github.com/stheil777/light-spot-catalog)"
 
-MAPTERHORN_URL = "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp"
+# Mapterhorn als PMTiles-Archive, gelesen per Range-Request vom Spiegel auf
+# Source Cooperative. Darum bittet Mapterhorn statt um Einzelabrufe am
+# Kachel-Endpoint (github.com/mapterhorn/mapterhorn/issues/317). Zoom 0-12
+# liegt in planet.pmtiles, Zoom 13 in 6-x-y.pmtiles, wo es hohe Aufloesung gibt.
+MAPTERHORN_FILES = "https://download.mapterhorn.com/download_urls.json"
+MAPTERHORN_MIRROR = "https://data.source.coop/mapterhorn/mapterhorn/"
 MAPTERHORN_ZOOMS = (13, 12)
 MAPTERHORN_TILE = 512
 EDGE_RADIUS_METERS = 100.0
 EDGE_STEP_METERS = 10.0
 EDGE_MIN_GAIN_METERS = 10.0
-
-# Grobe Hoehen von AWS Open Data (von Amazon gesponsert, kein Budget noetig).
-# Sie entscheiden, ob ein Spot ueberhaupt am Hang liegt: im Flachen ist die
-# grobe Hoehe schon richtig, nur an Kanten braucht es Mapterhorn.
-TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
-TERRARIUM_ZOOM = 12
-TERRARIUM_TILE = 256
-FLAT_RELIEF_METERS = 20.0
 
 # Rheintal: wo die App benutzt wird, kommt zuerst dran.
 HOME = (50.17, 7.70)
@@ -332,16 +329,79 @@ def write_manifest(out_dir, counts, osm_date):
 
 # ---------------------------------------------------------------- Mapterhorn
 
+class Throttled(Exception):
+    """Der Server sagt "zu viel" (403/429/503): fuer heute Schluss."""
+
+
+def http_range(url, offset, length):
+    request = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Range": f"bytes={offset}-{offset + length - 1}"})
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 429, 503):
+                raise Throttled(f"HTTP {error.code}")
+            if attempt == 3:
+                raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt == 3:
+                raise
+        time.sleep(5 * (attempt + 1))
+
+
+class MapterhornArchive:
+    """Kacheln aus Mapterhorns PMTiles. Kopf und Verzeichnisse bleiben im
+    Speicher, je Kachel geht dann meist genau ein Range-Request raus."""
+
+    def __init__(self, files_url=MAPTERHORN_FILES, mirror=MAPTERHORN_MIRROR):
+        from pmtiles.reader import Reader  # nur hier noetig
+        from pmtiles.tile import deserialize_header
+        self.reader_class, self.deserialize_header = Reader, deserialize_header
+        with urllib.request.urlopen(urllib.request.Request(
+                files_url, headers={"User-Agent": USER_AGENT}), timeout=60) as response:
+            self.names = {item["name"] for item in json.load(response)["items"]}
+        self.mirror = mirror
+        self.readers = {}
+
+    def _reader(self, name):
+        if name not in self.readers:
+            url = self.mirror + name
+            header = self.deserialize_header(http_range(url, 0, 127))
+            directories = {}
+
+            def get_bytes(offset, length):
+                if offset >= header["tile_data_offset"]:
+                    return http_range(url, offset, length)
+                if (offset, length) not in directories:
+                    directories[(offset, length)] = http_range(url, offset, length)
+                return directories[(offset, length)]
+
+            self.readers[name] = self.reader_class(get_bytes)
+        return self.readers[name]
+
+    def __call__(self, z, x, y):
+        """webp-Bytes oder None, wenn es die Kachel nicht gibt."""
+        if z > 12:
+            name = f"6-{x >> (z - 6)}-{y >> (z - 6)}.pmtiles"
+            if name not in self.names:
+                return None
+        else:
+            name = "planet.pmtiles"
+        return self._reader(name).get(z, x, y)
+
+
 class Terrain:
     """Hoehen aus Kacheln im Terrarium-Format, mit Plattencache und Budget."""
 
-    def __init__(self, cache_dir, budget, url=MAPTERHORN_URL, tile_size=MAPTERHORN_TILE,
+    def __init__(self, cache_dir, budget, fetch, tile_size=MAPTERHORN_TILE,
                  zooms=MAPTERHORN_ZOOMS, suffix="webp"):
         from PIL import Image  # nur hier noetig
         self.image = Image
         self.cache_dir = cache_dir
         self.budget = budget
-        self.url = url
+        self.fetch = fetch
         self.tile_size = tile_size
         self.zooms = zooms
         self.suffix = suffix
@@ -368,21 +428,18 @@ class Terrain:
         else:
             if self.exhausted:
                 return None
-            request = urllib.request.Request(
-                self.url.format(z=z, x=x, y=y), headers={"User-Agent": USER_AGENT})
             self.downloads += 1
             try:
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    data = response.read()
-            except urllib.error.HTTPError as error:
-                if error.code == 404:
-                    self.missing.add(key)
-                elif error.code in (403, 429, 503):
-                    # Nicht weiter anklopfen: fuer heute Schluss.
-                    log(f"    {self.suffix}-Kacheln: HTTP {error.code}, Pause bis morgen")
-                    self.downloads = self.budget
+                data = self.fetch(z, x, y)
+            except Throttled as error:
+                # Nicht weiter anklopfen: fuer heute Schluss.
+                log(f"    {self.suffix}-Kacheln: {error}, Pause bis morgen")
+                self.downloads = self.budget
                 return None
             except (urllib.error.URLError, TimeoutError, OSError):
+                return None
+            if data is None:
+                self.missing.add(key)
                 return None
             with open(path, "wb") as handle:
                 handle.write(data)
@@ -408,6 +465,45 @@ class Terrain:
     def _height(self, image, px, py):
         r, g, b = image.getpixel((px, py))
         return r * 256 + g + b / 256 - 32768
+
+    def prefetch(self, points, workers=8):
+        """Kacheln fuer viele Punkte gleichzeitig auf die Platte holen.
+
+        Einzeln dauert ein Range-Request am Spiegel ~0,1-1 s; nacheinander
+        waeren das fuer die Welt Tage. Nur die Kachel unter dem Punkt selbst,
+        Nachbarn am Kachelrand holt _tile wie bisher einzeln.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        def path_of(key):
+            return os.path.join(self.cache_dir, f"{self.suffix}_{key[0]}_{key[1]}_{key[2]}")
+
+        def load(key):
+            path = path_of(key)
+            if os.path.exists(path) or self.exhausted:
+                return
+            try:
+                data = self.fetch(*key)
+            except Throttled:
+                return  # _tile meldet es und zieht die Notbremse
+            except (urllib.error.URLError, TimeoutError, OSError):
+                return
+            self.downloads += 1
+            if data is not None:
+                with open(path + ".tmp", "wb") as handle:
+                    handle.write(data)
+                os.replace(path + ".tmp", path)
+
+        # Feinste Zoomstufe zuerst; die groebere nur, wo es die feine nicht gibt.
+        for z in self.zooms:
+            keys = set()
+            for lat, lon in points:
+                finer = [self._position(lat, lon, f)[:2] for f in self.zooms if f > z]
+                if any(os.path.exists(path_of((f, *xy))) for f, xy in zip(self.zooms, finer)):
+                    continue
+                keys.add((z, *self._position(lat, lon, z)[:2]))
+            with ThreadPoolExecutor(workers) as pool:
+                list(pool.map(load, keys))
 
     def zoom_for(self, lat, lon):
         for z in self.zooms:
@@ -499,19 +595,8 @@ def write_cell_file(path, payload):
         handle.write(compressor.compress(raw) + compressor.flush())
 
 
-def resolve_height(spot, terrain, coarse, totals):
+def resolve_height(spot, terrain, totals):
     """Traegt Hoehe (und ggf. Standpunkt an der Kante) in einen Spot ein."""
-    if coarse.exhausted:
-        # Ohne Vorpruefung wuerde auch flaches Land Mapterhorn-Budget kosten.
-        # Morgen ist wieder Budget da.
-        return
-    rough = coarse.relief(spot["a"], spot["o"])
-    if rough is not None and rough[1] < FLAT_RELIEF_METERS:
-        # Flach: die grobe Hoehe ist hier schon richtig, keine Kante zum Rauf-
-        # ruecken. Kostet Mapterhorn nichts.
-        spot["h"] = round(rough[0], 1)
-        totals["heights_flat"] += 1
-        return
     if terrain.exhausted:
         return
     stand = terrain.standpoint(spot["a"], spot["o"], snaps_to_edge(spot["g"]))
@@ -542,40 +627,39 @@ def previous_manifest(previous_dir):
         return json.load(handle)
 
 
-def build_band(band, bands, previous_dir, out_dir, height_budget,
-               coarse_budget=40000, time_budget_minutes=290):
+def build_band(band, bands, previous_dir, out_dir, height_budget, time_budget_minutes=290,
+               fetch=None):
     """Ein Band traegt fehlende Standpunkthoehen nach, Rheintal zuerst.
 
-    Mapterhorn wird von Freiwilligen betrieben: je Band und Tag nur
-    `height_budget` Kacheln. Geaendert wird nur, was eine Hoehe bekommt; der
-    Rest kommt beim Zusammenbauen aus dem letzten Katalog.
+    `height_budget` Kacheln je Band als Notbremse. Geaendert wird nur, was eine
+    Hoehe bekommt; der Rest kommt beim Zusammenbauen aus dem letzten Katalog.
     """
     os.makedirs(out_dir, exist_ok=True)
     cache = os.path.join(out_dir, "..", ".terrain-cache")
-    terrain = Terrain(cache, height_budget)
-    coarse = Terrain(cache, coarse_budget, url=TERRARIUM_URL, tile_size=TERRARIUM_TILE,
-                     zooms=(TERRARIUM_ZOOM,), suffix="png")
+    terrain = Terrain(cache, height_budget, fetch or MapterhornArchive())
     old = previous_manifest(previous_dir)
     names = sorted((n for n, c in old["cells"].items() if c), key=home_distance)[band::bands]
     started = time.time()
     deadline = started + time_budget_minutes * 60
     cells_out = {}
-    totals = {"heights_new": 0, "heights_flat": 0, "heights_missing": 0}
+    totals = {"heights_new": 0, "heights_missing": 0}
 
     for name in names:
-        if time.time() > deadline or coarse.exhausted:
+        if time.time() > deadline or terrain.exhausted:
             log(f"  Zeit oder Budget um bei {name}: Rest morgen")
             break
         payload = previous_spots(previous_dir, name)
         if payload is None:
             continue
-        before = totals["heights_new"] + totals["heights_flat"]
+        before = totals["heights_new"]
+        terrain.prefetch([(s["a"], s["o"]) for s in payload.get("spots", [])
+                          if needs_height(s["g"]) and "h" not in s])
         for spot in payload.get("spots", []):
             if needs_height(spot["g"]) and "h" not in spot and time.time() <= deadline:
-                resolve_height(spot, terrain, coarse, totals)
+                resolve_height(spot, terrain, totals)
                 if "h" not in spot:
                     totals["heights_missing"] += 1
-        if totals["heights_new"] + totals["heights_flat"] > before:
+        if totals["heights_new"] > before:
             write_cell_file(os.path.join(out_dir, f"{name}.bin"), payload)
             cells_out[name] = len(payload["spots"])
             # Nach jeder Zelle sichern: wird das Band abgebrochen, laedt der
@@ -584,8 +668,7 @@ def build_band(band, bands, previous_dir, out_dir, height_budget,
 
     save_band_manifest(out_dir, band, cells_out)
     log(f"Band {band}: {len(cells_out)} Zellen geaendert, {totals} · Mapterhorn "
-        f"{terrain.downloads} Kacheln · AWS {coarse.downloads} Kacheln · "
-        f"{int(time.time() - started)} s")
+        f"{terrain.downloads} Kacheln · {int(time.time() - started)} s")
 
 
 def save_band_manifest(out_dir, band, cells):
@@ -748,8 +831,8 @@ def main():
     parser.add_argument("--status", help="Release-Ordner: Stand als Markdown ausgeben")
     parser.add_argument("--failed-bands", default="")
     parser.add_argument("--selftest", action="store_true")
-    parser.add_argument("--height-budget", type=int, default=2000,
-                        help="Mapterhorn-Kacheln je Band und Lauf")
+    parser.add_argument("--height-budget", type=int, default=1_000_000,
+                        help="Mapterhorn-Kacheln je Band und Lauf (Notbremse)")
     parser.add_argument("--time-budget", type=int, default=290,
                         help="Minuten; danach nur noch speichern")
     args = parser.parse_args()

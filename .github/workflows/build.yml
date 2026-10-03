@@ -4,10 +4,10 @@ name: Spot-Katalog bauen
 # zuerst). Die Orte selbst kommen einmal die Woche aus osm.yml.
 # Jedes Band hoert nach 290 Minuten auf und speichert, was es hat.
 #
-# Budgets, damit niemand die App sperrt:
-# - Mapterhorn: 2000 Kacheln je Band, nur fuer Spots am Hang.
-#   Bei 403/429/503 ist fuer den Tag Schluss.
-# - AWS Terrarium (grobe Hoehen, von Amazon gesponsert): 40 000 je Band.
+# Hoehen aus Mapterhorns PMTiles, per Range-Request vom Spiegel auf Source
+# Cooperative; so bittet Mapterhorn darum (statt Einzelabrufen am
+# Kachel-Endpoint, bis 02.10.2026 mit 2000 Kacheln je Band und Tag).
+# Bei 403/429/503 ist fuer den Tag Schluss.
 # Von Hand: "Actions -> Spot-Katalog bauen -> Run workflow".
 on:
   push:
@@ -36,8 +36,7 @@ jobs:
     timeout-minutes: 340
     strategy:
       fail-fast: false
-      # Zwei gleichzeitig: Mapterhorn wird von Freiwilligen betrieben.
-      max-parallel: 2
+      max-parallel: 6
       matrix:
         band: [0, 1, 2, 3, 4, 5]
     steps:
@@ -45,7 +44,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install pillow==10.4.0
+      - run: pip install pillow==10.4.0 pmtiles==3.8.1
       - name: Letzten Katalog holen
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,7 +57,7 @@ jobs:
         timeout-minutes: 320
         run: |
           python build_catalog.py --band ${{ matrix.band }} --bands 6 \
-            --previous previous --out out --height-budget 2000 \
+            --previous previous --out out \
             --time-budget 290
       # Auch nach Abbruch oder Fehler: jede fertige Zelle zaehlt.
       - uses: actions/upload-artifact@v7
