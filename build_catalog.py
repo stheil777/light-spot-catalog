@@ -288,7 +288,7 @@ def assemble_osm(osm_dir, previous_dir, out_dir, partial=False):
         former = {spot_key(s): s for s in (previous_spots(previous_dir, name) or {}).get("spots", [])}
         for key, spot in spots.items():
             old = former.get(key)
-            if old and "h" in old and same_place(old, spot):
+            if old and "h" in old and same_place(old, spot) and not stale_standpoint(old):
                 spot["h"] = old["h"]
                 if "s" in old:
                     spot["s"] = old["s"]
@@ -573,10 +573,15 @@ def needs_height(tags):
 
 
 def snaps_to_edge(tags):
-    # Deckungsgleich mit EdgeStandpointPolicy in der App: VIEWPOINT, MOUNTAIN.
-    return (tags.get("tourism") == "viewpoint"
-            or tags.get("tower:type") == "observation"
-            or tags.get("natural") == "peak")
+    # Deckungsgleich mit EdgeStandpointPolicy in der App: nur MOUNTAIN.
+    # Aussichtspunkte nicht: an der Steilkueste liegt der hoechste Punkt im
+    # Umkreis landeinwaerts (Partilha, Madeira: 95 m ins Feld).
+    return tags.get("natural") == "peak"
+
+
+def stale_standpoint(spot):
+    """Standpunkt nach alter Regel verschoben: Hoehe gehoert nicht zum Ort."""
+    return "s" in spot and not snaps_to_edge(spot["g"])
 
 
 def spot_key(spot):
@@ -652,6 +657,11 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, time_budget_mi
         if payload is None:
             continue
         before = totals["heights_new"]
+        stale = 0
+        for spot in payload.get("spots", []):
+            if stale_standpoint(spot):
+                del spot["s"], spot["h"]
+                stale += 1
         terrain.prefetch([(s["a"], s["o"]) for s in payload.get("spots", [])
                           if needs_height(s["g"]) and "h" not in s])
         for spot in payload.get("spots", []):
@@ -659,7 +669,7 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, time_budget_mi
                 resolve_height(spot, terrain, totals)
                 if "h" not in spot:
                     totals["heights_missing"] += 1
-        if totals["heights_new"] > before:
+        if totals["heights_new"] > before or stale:
             write_cell_file(os.path.join(out_dir, f"{name}.bin"), payload)
             cells_out[name] = len(payload["spots"])
             # Nach jeder Zelle sichern: wird das Band abgebrochen, laedt der
