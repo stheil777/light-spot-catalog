@@ -25,14 +25,23 @@ for ((i = 0; i < ${#FILES[@]}; i += 50)); do
 done
 upload release/manifest.json
 gh release edit "$TAG" "${R[@]}" --draft=false --latest
+python build_catalog.py --status release --failed-bands "${1:-}" > status.md
+# Ein Release mit 1000 Dateien loeschen bricht GitHub seit 13.10.2026 oft mit
+# HTTP 502 ab. Darum: mehrfach versuchen, und ein Rest bleibt nur Warnung, der
+# Katalog ist zu diesem Zeitpunkt schon live.
+remove() {
+  for try in 1 2 3; do
+    gh release delete "$1" "${R[@]}" --yes --cleanup-tag && return 0
+    echo "Loeschen von $1 fehlgeschlagen (Versuch $try), warte 2 Minuten"; sleep 120
+  done
+  echo "::warning::Alter Katalog $1 nicht geloescht"
+  echo "- Alter Katalog \`$1\` liess sich nicht loeschen (GitHub-Fehler), naechster Lauf versucht es wieder." >> status.md
+}
 # Nach Tag sortieren (catalog-JJJJMMTT-HHMM): createdAt ist das Commit-Datum
 # und bei allen Releases gleich; bis 01.10.2026 flog so der neueste raus.
 # Entwuerfe (abgebrochene Laeufe) haben keinen Wert und gehen mit.
 gh release list "${R[@]}" --limit 100 --json tagName,isDraft \
   --jq '(map(select(.isDraft)) | .[].tagName), (map(select(.isDraft | not)) | sort_by(.tagName) | reverse | .[2:] | .[].tagName)' \
-  | while read -r old; do
-      gh release delete "$old" "${R[@]}" --yes --cleanup-tag
-    done
-python build_catalog.py --status release --failed-bands "${1:-}" > status.md
+  | while read -r old; do remove "$old"; done
 cat status.md
 gh issue comment 1 "${R[@]}" --body-file status.md
