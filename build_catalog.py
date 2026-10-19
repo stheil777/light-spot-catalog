@@ -65,6 +65,13 @@ MAPTERHORN_TILE = 512
 EDGE_RADIUS_METERS = 100.0
 EDGE_STEP_METERS = 10.0
 EDGE_MIN_GAIN_METERS = 10.0
+# Liegt das Gelaende am Kartenpunkt mehr als ELE_TRIGGER unter der OSM-Hoehe
+# (ele), steht der Punkt unterhalb der Kante (Eira do Serrado, Madeira: 892 m
+# statt 1050 m). Dann gilt die Stelle im Umkreis, die bis auf ELE_MATCH passt.
+# Nur nach oben: ein zu niedriges ele (Miradouro da Achada: 100 m, Gelaende
+# 155 m) zoege den Punkt sonst in die Schlucht.
+ELE_TRIGGER_METERS = 25.0
+ELE_MATCH_METERS = 15.0
 
 # Rheintal: wo die App benutzt wird, kommt zuerst dran.
 HOME = (50.17, 7.70)
@@ -290,8 +297,9 @@ def assemble_osm(osm_dir, previous_dir, out_dir, partial=False):
             old = former.get(key)
             if old and "h" in old and same_place(old, spot) and not stale_standpoint(old):
                 spot["h"] = old["h"]
-                if "s" in old:
-                    spot["s"] = old["s"]
+                for field in ("s", "e"):
+                    if field in old:
+                        spot[field] = old[field]
                 reused += 1
         if partial:
             for key, old in former.items():
@@ -537,7 +545,7 @@ class Terrain:
                     low, high = min(low, h), max(high, h)
         return centre, high - low
 
-    def standpoint(self, lat, lon, snap_to_edge):
+    def standpoint(self, lat, lon, snap_to_edge, ele=None):
         """(lat, lon, hoehe) oder None, wenn keine Daten erreichbar sind."""
         z = self.zoom_for(lat, lon)
         if z is None:
@@ -546,6 +554,24 @@ class Terrain:
         if centre is None:
             return None
         best = (lat, lon, centre)
+        if ele is not None and not snap_to_edge and ele - centre > ELE_TRIGGER_METERS:
+            m_lat = 111_320.0
+            m_lon = max(m_lat * math.cos(math.radians(lat)), 1.0)
+            steps = int(EDGE_RADIUS_METERS // EDGE_STEP_METERS)
+            score = None
+            for i in range(-steps, steps + 1):
+                for j in range(-steps, steps + 1):
+                    north, east = i * EDGE_STEP_METERS, j * EDGE_STEP_METERS
+                    if north * north + east * east > EDGE_RADIUS_METERS ** 2:
+                        continue
+                    c_lat, c_lon = lat + north / m_lat, lon + east / m_lon
+                    h = self.height(c_lat, c_lon, z)
+                    if h is None or abs(h - ele) > ELE_MATCH_METERS:
+                        continue
+                    # Passende Hoehe zuerst, bei Gleichstand der naehere Punkt.
+                    candidate = abs(h - ele) + math.hypot(north, east) / 20
+                    if score is None or candidate < score:
+                        score, best = candidate, (c_lat, c_lon, h)
         if snap_to_edge:
             m_lat = 111_320.0
             m_lon = max(m_lat * math.cos(math.radians(lat)), 1.0)
@@ -579,9 +605,25 @@ def snaps_to_edge(tags):
     return tags.get("natural") == "peak"
 
 
+def ele_of(tags):
+    """OSM-Hoehe in Metern oder None ("1050", "1050 m"; Fuss und Murks: None)."""
+    raw = str(tags.get("ele", "")).strip().removesuffix("m").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if -500 < value < 9000 else None
+
+
 def stale_standpoint(spot):
-    """Standpunkt nach alter Regel verschoben: Hoehe gehoert nicht zum Ort."""
-    return "s" in spot and not snaps_to_edge(spot["g"])
+    """Hoehe neu rechnen: Standpunkt nach alter Regel verschoben (Aussichtspunkt
+    auf den hoechsten Punkt im Umkreis) oder ele-Regel noch nicht angewendet."""
+    if snaps_to_edge(spot["g"]) or "e" in spot:
+        return False
+    if "s" in spot:
+        return True
+    ele = ele_of(spot["g"])
+    return "h" in spot and ele is not None and ele - spot["h"] > ELE_TRIGGER_METERS
 
 
 def spot_key(spot):
@@ -604,11 +646,15 @@ def resolve_height(spot, terrain, totals):
     """Traegt Hoehe (und ggf. Standpunkt an der Kante) in einen Spot ein."""
     if terrain.exhausted:
         return
-    stand = terrain.standpoint(spot["a"], spot["o"], snaps_to_edge(spot["g"]))
+    ele = ele_of(spot["g"])
+    snap = snaps_to_edge(spot["g"])
+    stand = terrain.standpoint(spot["a"], spot["o"], snap, ele)
     if stand is None:
         return
     s_lat, s_lon, h = stand
     spot["h"] = round(h, 1)
+    if ele is not None and not snap:
+        spot["e"] = 1  # ele-Regel angewendet, nicht jeden Tag neu
     if (s_lat, s_lon) != (spot["a"], spot["o"]):
         spot["s"] = [round(s_lat, 6), round(s_lon, 6)]
     totals["heights_new"] += 1
@@ -660,7 +706,8 @@ def build_band(band, bands, previous_dir, out_dir, height_budget, time_budget_mi
         stale = 0
         for spot in payload.get("spots", []):
             if stale_standpoint(spot):
-                del spot["s"], spot["h"]
+                spot.pop("s", None)
+                spot.pop("h", None)
                 stale += 1
         terrain.prefetch([(s["a"], s["o"]) for s in payload.get("spots", [])
                           if needs_height(s["g"]) and "h" not in s])
@@ -822,6 +869,23 @@ def selftest():
             cells = json.load(handle)["cells"]
         assert sum(1 for c in cells.values() if c) == 2 and cells["c22_37"] == 3
         assert len([f for f in os.listdir(os.path.join(tmp, "rel3")) if f.endswith(".bin")]) == 2
+
+    # ele-Regel: Kartenpunkt 892 m, Kante mit 1050 m liegt 90 m noerdlich.
+    class Slope:
+        def zoom_for(self, lat, lon):
+            return 13
+
+        def height(self, lat, lon, z):
+            return 1050.0 if lat >= 32.7 + 85 / 111_320 else 892.0
+    lat, lon, h = Terrain.standpoint(Slope(), 32.7, -16.96, False, 1050.0)
+    assert h == 1050.0 and lat > 32.7, (lat, h)
+    assert Terrain.standpoint(Slope(), 32.7, -16.96, False, None) == (32.7, -16.96, 892.0)
+    assert Terrain.standpoint(Slope(), 32.7, -16.96, False, 1500.0) == (32.7, -16.96, 892.0)
+    assert ele_of({"ele": "1050 m"}) == 1050.0 and ele_of({"ele": "3000 ft"}) is None
+    view = {"g": {"tourism": "viewpoint", "ele": "1050"}, "h": 892.0}
+    assert stale_standpoint(view) and not stale_standpoint({**view, "e": 1})
+    assert not stale_standpoint({**view, "h": 1040.0}) and not stale_standpoint({**view, "h": 1200.0})
+    assert Terrain.standpoint(Slope(), 32.7, -16.96, False, 800.0) == (32.7, -16.96, 892.0)
     log("Selbsttest ok")
 
 
