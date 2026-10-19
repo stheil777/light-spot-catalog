@@ -1,0 +1,57 @@
+name: Alte Kataloge abbauen
+
+# Einen Release mit 1000 Dateien am Stueck loeschen lehnt GitHub seit
+# 13.10.2026 mit HTTP 502 ab. Darum die Dateien der Altkataloge einzeln,
+# dann den leeren Release. Bremst GitHub (403/429), ist fuer diese Stunde
+# Schluss, der naechste Lauf macht weiter. Behalten werden die zwei neuesten
+# Kataloge, wie in publish.sh; die App liest nur "Latest".
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+# Eigene Gruppe: in "spot-catalog" wuerde ein wartender Abbau-Lauf einen
+# wartenden Bau- oder OSM-Lauf verdraengen.
+concurrency:
+  group: catalog-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Abbauen
+        run: |
+          set -euo pipefail
+          REPO="$GITHUB_REPOSITORY"
+          # Laeuft gerade ein Upload, bleibt das Stundenlimit fuer ihn.
+          BUSY=$(gh run list --repo "$REPO" --json workflowName,status \
+            --jq '[.[] | select(.workflowName != "Alte Kataloge abbauen") | select(.status != "completed")] | length')
+          if [ "$BUSY" -gt 0 ]; then echo "Bau oder OSM laeuft, naechste Stunde"; exit 0; fi
+          OLDS=$(gh release list --repo "$REPO" --limit 100 --json tagName,isDraft \
+            --jq 'map(select(.isDraft | not)) | sort_by(.tagName) | reverse | .[2:] | .[].tagName')
+          if [ -z "$OLDS" ]; then echo "Nichts abzubauen"; exit 0; fi
+          for OLD in $OLDS; do
+            ID=$(gh api "repos/$REPO/releases/tags/$OLD" --jq .id)
+            gh api --paginate "repos/$REPO/releases/$ID/assets?per_page=100" --jq '.[].id' > ids.txt
+            n=0
+            while read -r asset; do
+              if ! gh api -X DELETE "repos/$REPO/releases/assets/$asset" --silent < /dev/null; then
+                echo "$OLD: GitHub bremst nach $n Dateien, weiter in der naechsten Stunde"
+                exit 0
+              fi
+              n=$((n + 1))
+            done < ids.txt
+            if gh release delete "$OLD" --repo "$REPO" --yes --cleanup-tag < /dev/null; then
+              echo "$OLD geloescht ($n Dateien)"
+            else
+              echo "::warning::$OLD leer, Release selbst nicht geloescht"
+            fi
+          done

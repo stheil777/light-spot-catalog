@@ -720,7 +720,6 @@ def status(release_dir, failed_bands=""):
     cells = manifest["cells"]
     with_spots = [n for n, c in cells.items() if c]
     need = have = 0
-    loreley = False
     home = cell_name(*cell_of(*HOME))
     for name in with_spots:
         spots = read_cell_file(os.path.join(release_dir, f"{name}.bin"))["spots"]
@@ -728,8 +727,6 @@ def status(release_dir, failed_bands=""):
             if needs_height(spot["g"]):
                 need += 1
                 have += "h" in spot
-        if name == home:
-            loreley = any("lorele" in s["g"].get("name", "").lower() for s in spots)
     missing = [n for n in all_cells() if n not in cells]
 
     lines = [
@@ -737,7 +734,7 @@ def status(release_dir, failed_bands=""):
         f"{len(with_spots)} Kacheln mit Spots · {sum(cells.values())} Spots",
         f"- Standpunkthoehen: {have} von {need} ({round(100 * have / max(need, 1))} %)",
         f"- Rheintal ({home}): "
-        + (f"{cells[home]} Spots · Loreley: {'ja' if loreley else 'nein'}" if cells.get(home) else "nicht drin"),
+        + (f"{cells[home]} Spots" if cells.get(home) else "nicht drin"),
     ]
     if missing:
         lines.append(f"- Nicht im Katalog (App fragt dort Overpass): {len(missing)} Zellen")
