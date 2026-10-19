@@ -781,7 +781,7 @@ def selftest():
         prev = os.path.join(tmp, "prev")
         os.makedirs(prev)
         write_cell_file(os.path.join(prev, "c22_37.bin"), {"spots": [
-            {"t": "node", "i": 1, "a": 50.14001, "o": 7.73, "g": {}, "h": 192.0, "s": [50.1401, 7.7301]}]})
+            {"t": "node", "i": 1, "a": 50.14001, "o": 7.73, "g": {"tourism": "viewpoint"}, "h": 192.0}]})
         assemble_osm(os.path.join(tmp, "osm"), prev, os.path.join(tmp, "rel"))
         with open(os.path.join(tmp, "rel", "manifest.json")) as handle:
             manifest = json.load(handle)
@@ -791,7 +791,10 @@ def selftest():
         assert set(spots) == {"node/1", "way/2", "relation/5"}, set(spots)
         assert spots["relation/5"]["g"]["name"] == "Feste Franz"
         assert (spots["relation/5"]["a"], spots["relation/5"]["o"]) == (50.3, 7.6)
-        assert spots["node/1"]["h"] == 192.0 and spots["node/1"]["s"] == [50.1401, 7.7301]
+        assert spots["node/1"]["h"] == 192.0 and "s" not in spots["node/1"]
+        # Nach alter Regel verschobener Aussichtspunkt: Hoehe neu rechnen, Gipfel behalten.
+        assert stale_standpoint({"s": [0, 0], "g": {"tourism": "viewpoint"}})
+        assert not stale_standpoint({"s": [0, 0], "g": {"natural": "peak"}})
         assert spots["way/2"]["a"] == 50.2 and spots["way/2"]["o"] == 7.1
         assert manifest["cells"][cell_name(*cell_of(32.65, -16.85))] == 1
         assert "relation/3" in {spot_key(s) for s in read_cell_file(

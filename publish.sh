@@ -3,6 +3,16 @@
 # behaelt die zwei neuesten Kataloge. Aufruf: publish.sh "<ausgefallene Jobs>"
 set -euo pipefail
 R=(--repo "$GITHUB_REPOSITORY")
+# Kacheln wie im letzten Katalog: kein neuer Release. Seit alle Hoehen da sind
+# (06.10.2026), kam sonst taeglich eine Kopie dazu, die GitHub nicht mehr
+# loeschen kann. Das Manifest zaehlt nicht mit, es traegt die Bauzeit.
+if [ -s previous/manifest.json ] && diff -rq -x manifest.json release previous > /dev/null; then
+  python build_catalog.py --status release --failed-bands "${1:-}" > status.md
+  echo "- Kacheln unveraendert, kein neuer Katalog veroeffentlicht." >> status.md
+  cat status.md
+  gh issue comment 1 "${R[@]}" --body-file status.md
+  exit 0
+fi
 TAG="catalog-$(date -u +%Y%m%d-%H%M)"
 # Erst als Entwurf: die App sieht den Katalog erst, wenn alles oben ist.
 gh release create "$TAG" "${R[@]}" --draft \
